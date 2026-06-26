@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Engagement / loot artifacts (never commit target data)
+*.req
+req.txt
+request.txt
+loot/
+output/
+*.log
+*.dump
+hashes.txt
+creds.txt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
