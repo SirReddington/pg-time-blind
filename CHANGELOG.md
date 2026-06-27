@@ -1,5 +1,19 @@
 # Changelog
 
+## v3.1 — Default DB mapping + table dump
+
+### Added
+- **Map mode is now the default** (no `--query` needed): after detection it prints the
+  **DBMS, current database, and table list** — quiet by design (no columns/rows).
+- **`--dump TABLE`**: auto-discovers the table's columns and dumps its rows, capped by
+  **`--max-rows`** (default 50), rendered as an aligned table.
+- Per-DBMS schema queries for PostgreSQL/MySQL/MSSQL/Oracle (`information_schema`,
+  `group_concat`/`string_agg`/`listagg`, dialect-correct `LIMIT/OFFSET/FETCH`).
+
+### Changed
+- `--query` is now **optional** (power mode). `--query` and `--dump` are mutually exclusive.
+- Long values use a binary-search length probe (handles big aggregates like table lists).
+
 ## v3.0 — Multi-DBMS + automatic technique selection
 
 > Renamed: `pg-time-blind` → **blindfold** (script `pg_time_blind.py` → `blindfold.py`).

