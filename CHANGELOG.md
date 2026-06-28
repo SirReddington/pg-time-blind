@@ -1,5 +1,22 @@
 # Changelog
 
+## v3.6.0 — dump count fix + bigger banner
+
+### Fixed
+- **`--dump` no longer reports `rows: 0` on PostgreSQL/Oracle when the table has data.**
+  The row count was extracted as a raw `count(*)` (an integer); the per-character extractor
+  wraps the value in `length()` / `substr()`, which **error on a non-text argument** in
+  strict engines (PostgreSQL `length(<bigint>)`, Oracle), so the count read back as 0 and
+  nothing was dumped. `q_count` now casts to text per dialect (`as text` / `as char` /
+  `as varchar` / `to_char`). MySQL auto-casts, so it was never affected.
+
+### Added
+- **`--delay` / `--jitter`** — fixed + random inter-request pacing (rate-limit / WAF friendly).
+
+### Changed
+- Bigger ASCII banner in **bold red**, with "created by Hassan Almatar" centered directly
+  beneath it.
+
 ## v3.5.2 — request hygiene: marker check + header sanitization
 
 ### Fixed
