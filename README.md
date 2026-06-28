@@ -153,12 +153,14 @@ python3 blindfold.py [target] [action] [detection] [tuning]
 | `--sleep`        | `3.0` | Seconds for the time-based sleep |
 | `--threshold`    | *adaptive* | Absolute "slept" cutoff. Default: sampled baseline latency + margin |
 | `--cal-samples`  | `5` | Baseline latency samples for the adaptive threshold |
-| `--retries`      | `1` | Re-confirm each time-based positive N times (beats jitter) |
+| `--retries`      | `1` | Time-oracle samples per check (majority vote; beats jitter) |
+| `--net-retries`  | `2` | Transport-level retries on connection errors (with backoff) |
 | `--threads`      | `1` | Parallel workers for **boolean** extraction (each char is verified) |
 | `--maxlen`       | `4096` | Max value length / binary length-probe cap |
 | `--ascii`        | off | ASCII-only target: skip the Unicode probe (1 fewer request/char) |
 | `--max-codepoint`| `0x10FFFF` | Upper bound for Unicode (non-ASCII) character extraction |
-| `--proxy`        | – | e.g. `http://127.0.0.1:8080` to view in Burp |
+| `--proxy`        | – | e.g. `http://127.0.0.1:8080` (Burp) or `socks5://127.0.0.1:1080` |
+| `--insecure`     | off | Skip TLS verification (and silence its warning) for self-signed lab hosts |
 
 ### Resume
 

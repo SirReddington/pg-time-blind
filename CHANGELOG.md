@@ -18,6 +18,29 @@
 ### Added
 - **`--ascii`**: skip the Unicode probe on ASCII-only targets (1 fewer request/char).
 
+### Peer-review hardening
+- **`requests.Session()`** for all traffic — connection keep-alive, cookie persistence,
+  and a real speedup over per-request connections.
+- **TLS verification on by default**; `--insecure` opts out and scopes the urllib3 warning
+  suppression to that case only (was suppressed globally before).
+- **MySQL error-based now HEX-encodes** the leaked value — values containing quotes, `<`, `>`,
+  `&` (and multibyte UTF-8) are recovered intact instead of being truncated by the old regex.
+- **Oracle identifiers are whitelisted** (`^[A-Za-z0-9_$#]+$`) before use as bare identifiers.
+- **Fail loud on inconclusive DBMS fingerprint** — abort with guidance to pass `--dbms`
+  instead of silently assuming PostgreSQL.
+- **Time oracle uses a majority vote** over `retries+1` samples (robust to jitter both ways).
+- **`_bin_length` warns** when a value hits the `--maxlen` cap instead of silently truncating.
+- Friendly errors on malformed request lines / `-H` headers; SOCKS proxy dependency check.
+
+### Resilience
+- **Transport failures are now catchable and resumable.** `Target.send()` retries connection
+  errors with backoff (`--net-retries`, default 2) and then raises a catchable `RequestError`
+  instead of calling `SystemExit`.
+- **Threaded extraction checkpoints incrementally** — it commits the contiguous prefix as
+  workers finish, so a crash mid-run resumes from the last saved character (re-run the same
+  command). A failing worker no longer aborts the whole batch silently.
+- Clean top-level handling of `RequestError` / `KeyboardInterrupt` with proper exit codes.
+
 ## v3.2 — Reliability hardening
 
 ### Added
