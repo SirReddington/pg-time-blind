@@ -1,5 +1,23 @@
 # Changelog
 
+## v3.6.4 — error-based payloads short enough to fit tight length caps
+
+### Fixed
+- **Targeted error-based extraction now fits length-capped points.** v3.6.3 wrapped every leak in
+  `'~'||(…)` to force the cast to fail, which added ~7 characters — enough to overflow a tight
+  cap (a ~61-char point would leak `current_database()` but truncate `SELECT password FROM users
+  LIMIT 1`). The cast is now **direct** — `1=CAST((<query>) AS int)`, exactly like a hand-written
+  payload — so a non-numeric value fails the cast and the error quotes it, with no wrapper
+  overhead. The redundant extra parentheses around the query were also dropped.
+- The `~`-forced variant is now a **fallback** used only when the direct cast returns nothing
+  (i.e. a purely numeric value cast cleanly with no error), so numeric leaks (counts, ids) still
+  work without costing every text leak the extra length.
+
+### Changed
+- Clearer guidance when error-based returns nothing on a capped point: both `--query` and map
+  mode now explain the value may be too long and suggest a shorter targeted query (large
+  schema/map queries can't fit a very tight cap — extract directly instead).
+
 ## v3.6.3 — error-based that actually leaks on visible-error + length-capped targets
 
 ### Fixed
