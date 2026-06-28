@@ -165,6 +165,7 @@ python3 blindfold.py [target] [action] [detection] [tuning]
 | `--maxlen`       | `4096` | Max value length / binary length-probe cap |
 | `--charset`      | – | Restrict to a known alphabet for speed: `hex`/`HEX`/`digits`/`alnum` or a literal set (e.g. hashes drop to ~4 req/char) |
 | `--timeout`      | `30` | HTTP timeout seconds (auto-raised above `--sleep` for time-based) |
+| `-v, --verbose`  | off | Show detection internals (probe status/length + chosen discriminator) |
 | `--ascii`        | off | ASCII-only target: skip the Unicode probe (1 fewer request/char) |
 | `--max-codepoint`| `0x10FFFF` | Upper bound for Unicode (non-ASCII) character extraction |
 | `--proxy`        | – | e.g. `http://127.0.0.1:8080` (Burp) or `socks5://127.0.0.1:1080` |

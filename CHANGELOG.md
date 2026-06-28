@@ -1,5 +1,25 @@
 # Changelog
 
+## v3.5.1 — stronger boolean calibration + verbose diagnostics
+
+### Added
+- **`-v` / `--verbose`** — prints detection internals (per-context true/false probe status &
+  length, and which discriminator fired) so a failed detection is diagnosable instead of opaque.
+
+### Changed / Fixed
+- **Boolean calibration is far more robust** to dynamic pages (CSRF tokens, timestamps):
+  - length now uses **range separation** instead of strict stability — small jitter no longer
+    defeats it;
+  - added a **line/phrase discriminator** that catches multi-word markers like "Welcome back"
+    when no single word is uniquely true/false;
+  - added a **response-similarity** last resort for content-only differences.
+- **`--true-match` / `--false-match` are verified** before claiming detection (they used to be
+  trusted blindly, reporting a signal with 0 requests sent and then extracting nothing).
+
+> Tip: cookie/header injection still needs `--no-encode --tamper space2comment` (a cookie value
+> isn't URL-decoded server-side). Run with `-v` if detection fails — flat true/false lengths
+> mean the payload isn't landing (wrong page, encoding, or a fake base value), not a tool bug.
+
 ## v3.5.0 — UNION extraction + WAF tamper
 
 ### Added
