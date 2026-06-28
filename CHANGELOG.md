@@ -1,5 +1,17 @@
 # Changelog
 
+## v3.6.2 — fix UNION false positive on visible-error targets
+
+### Fixed
+- **UNION detection no longer false-positives when the page reflects errors.** The column
+  probe injected a plain literal (`'bfUc1z'`) and matched if it appeared anywhere in the
+  response — but a visible-error target echoes the payload inside its error text, so the
+  marker "reflected" without any UNION actually running. blindfold then locked onto
+  `union-based`, extracted nothing (`Database: None, Tables: 0`), and never reached the
+  error-based probe. The probe now emits each value as a **split concatenation**
+  (`'bf'||'Uc1z'`, dialect-aware), which only appears contiguously if the database truly
+  evaluated it — so error-reflecting targets correctly fall through to error-based.
+
 ## v3.6.1 — error-based detection that actually triggers, https auto-probe, failure diagnostic
 
 ### Fixed
