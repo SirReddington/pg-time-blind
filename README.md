@@ -115,7 +115,7 @@ python3 blindfold.py [target] [action] [detection] [tuning]
 | `-H, --header` | Extra header `'Name: value'`, repeatable (may contain the marker) |
 | `-X, --method` | HTTP method (default: `POST` if `-d` given, else `GET`) |
 | `--request`    | Raw HTTP request file containing the marker |
-| `--proto`      | Scheme for `--request` files (default `http`) |
+| `--proto`      | Force the scheme for `--request` files. Default: **auto-probe HTTPS, then fall back to HTTP** |
 
 ### Action (default: map the database)
 
@@ -142,6 +142,7 @@ python3 blindfold.py [target] [action] [detection] [tuning]
 | `--dbms`          | Pin the DBMS: `postgresql`, `mysql`, `mssql`, `oracle` (skips fingerprinting) |
 | `--force-boolean` | Only use boolean-based |
 | `--force-time`    | Only use time-based |
+| `--force-error`   | Only use error-based (skip boolean/time probing) |
 | `--no-error`      | Don't use error-based even if available |
 | `--no-union`      | Don't try UNION (reflected) extraction |
 | `--union-cols`    | Max columns to probe for UNION (default `12`) |
@@ -150,7 +151,6 @@ python3 blindfold.py [target] [action] [detection] [tuning]
 | `--true-match`    | String present **only** in a TRUE response (overrides calibration) |
 | `--false-match`   | String present **only** in a FALSE response |
 | `--len-margin`    | Min body-length gap to treat as a boolean signal (default `12`) |
-| `--len-jitter`    | Allowed body-length wobble within one response type (default `4`) |
 
 ### Tuning
 
@@ -170,12 +170,14 @@ python3 blindfold.py [target] [action] [detection] [tuning]
 | `--max-codepoint`| `0x10FFFF` | Upper bound for Unicode (non-ASCII) character extraction |
 | `--proxy`        | – | e.g. `http://127.0.0.1:8080` (Burp) or `socks5://127.0.0.1:1080` |
 | `--insecure`     | off | Skip TLS verification (and silence its warning) for self-signed lab hosts |
+| `--delay`        | `0` | Seconds to wait before each request (rate-limit / 504 evasion) |
+| `--jitter`       | `0` | Add a random `0..N` seconds on top of `--delay` |
 
 ### Resume
 
 | Flag | Meaning |
 |------|---------|
-| `--state` | Checkpoint file path (default: auto-named `.pgtb-<id>.json`) |
+| `--state` | Checkpoint file path (default: auto-named `.blindfold-<id>.json`) |
 | `--fresh` | Ignore any existing checkpoint and start over |
 
 ---
@@ -233,6 +235,14 @@ python3 blindfold.py -u http://t/login -d "username=INJECT&password=x" \
   --query "SELECT current_user"
 ```
 
+**6. Visible-error target (no boolean/time signal) — error-based self-detects the DBMS**
+
+```bash
+python3 blindfold.py --request req.txt \
+  --query "SELECT password FROM users WHERE username='administrator'"
+# pin it to error-based with --force-error if you want to skip boolean/time probing
+```
+
 ---
 
 ## Sample output
@@ -242,6 +252,7 @@ python3 blindfold.py -u http://t/login -d "username=INJECT&password=x" \
 [*] boolean probe : string-and ...
 [+] boolean signal on string-and: status==302
 [+] DBMS fingerprint: postgresql
+[*] error probe   : postgresql/string-and ...
 [+] error reflection on string-and (postgresql)
 
 [+] DBMS      : postgresql
@@ -360,11 +371,15 @@ blindfold.py --request req.txt --dbms mysql --webshell --os-path /var/www/html/s
 - If calibration mis-fires on a dynamic page, use `--true-match`/`--false-match` or raise `--len-margin`.
 - Behind a WAF, try `--tamper space2comment,randomcase` (and `charencode` for strict filters).
 - Interrupted? Re-run the **same** command to resume.
-- Found nothing? Try `--allow-or`, `--dbms`, `--force-time`, or check marker placement.
+- **`--request` over HTTPS just works** — the scheme is auto-probed (HTTPS first, HTTP fallback). Force it with `--proto https` / `--proto http`.
+- Found nothing? blindfold prints a **baseline-vs-injected diagnostic** telling you whether the
+  request itself is rejected (scheme / host / session), only the payload is rejected (WAF /
+  encoding), or responses simply don't change — then try `--allow-or`, `--dbms`,
+  `--force-time` / `--force-error`, or check marker placement.
 
 ## Contributing
 
-Issues and PRs welcome — especially Oracle time/error primitives, more injection contexts, and stealth (`--delay`/`--jitter`).
+Issues and PRs welcome — especially Oracle time/error primitives, more injection contexts, and additional `--tamper` modules.
 
 ## License
 

@@ -1,5 +1,31 @@
 # Changelog
 
+## v3.6.1 — error-based detection that actually triggers, https auto-probe, failure diagnostic
+
+### Fixed
+- **Error-based injection is now detected on its own.** Previously `find_error` could only run
+  *after* boolean or time had already fingerprinted the DBMS, so a classic visible-error target
+  (no boolean/time signal) bailed at "no blind injection detected" without ever probing for an
+  error. Detection now tries each candidate DBMS's forced-error syntax directly — the one whose
+  error reflects the probe **both confirms error-based and identifies the backend** — so
+  error-based works with zero blind signal. It also announces `[*] error probe : <dbms>/<ctx>`
+  alongside the boolean/time probes.
+- **`--request` now reaches HTTPS targets.** A raw request file carries no scheme and `--proto`
+  defaulted to `http`, so HTTPS-only targets (e.g. PortSwigger labs) silently 400'd every payload
+  and looked like "no injection". `--proto` now **auto-probes HTTPS first and falls back to HTTP**
+  only if the TLS endpoint is unreachable; pass `--proto http` to force plaintext.
+
+### Added
+- **`--force-error`** — only use error-based, skipping boolean/time probing (mutually exclusive
+  with `--force-boolean` / `--force-time`).
+- **Failure diagnostic.** When detection fails, blindfold sends a clean baseline and a
+  representative injected request and reports `status`/`len` for each, flagging the failure mode:
+  the injected request being rejected (WAF / encoding), the base request being rejected
+  (scheme / host / session), or identical responses (payload not landing).
+
+### Removed
+- Dead code: the unused `_stable()` helper and the unread `--len-jitter` flag.
+
 ## v3.6.0 — dump count fix + bigger banner
 
 ### Fixed
