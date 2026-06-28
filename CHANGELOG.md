@@ -1,5 +1,22 @@
 # Changelog
 
+## v3.4.0 — review pass: fail-loud fingerprint, charset, decoupled timeout
+
+### Added
+- **`--charset`** — restrict extraction to a known alphabet (preset `hex`/`HEX`/`digits`/`alnum`
+  or a literal set). Binary-searches within the alphabet, so e.g. a hex hash drops from
+  ~7 to ~4 requests/char (≈47% fewer in testing).
+- **`--timeout`** — HTTP timeout is now its own setting (auto-raised above `--sleep` so
+  time-based payloads still complete). Previously hard-coupled to `sleep + 20`.
+
+### Changed / Fixed
+- **No more PostgreSQL fallback.** If DBMS fingerprinting is inconclusive the tool now
+  stops and asks for `--dbms` instead of guessing (a wrong guess = wrong syntax = false negatives).
+- **Gentler Unicode growth** (`hi *= 2`) — less overshoot before the binary search.
+- **Threaded extraction checkpoints on *any* error**, not just transport ones — a logic
+  error can't lose the contiguous prefix (it's persisted, then re-raised).
+- File handles use `with` context managers (request file, state file).
+
 ## v3.3.0 — `--rce` (command exec) and `--webshell` (file drop)
 
 Two distinct, DBMS-aware RCE actions. Both run after auto-detection (DBMS + technique +

