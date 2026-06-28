@@ -1,5 +1,19 @@
 # Changelog
 
+## v3.5.0 — UNION extraction + WAF tamper
+
+### Added
+- **UNION-based extraction** (`union-based` technique). When the injection reflects output,
+  blindfold discovers the column count and the reflecting column, then reads each value in a
+  **single request** (`UNION SELECT ... wrap(value) ...`) instead of per-character blind work.
+  It's now the **preferred** technique (union → error → boolean → time). Per-DBMS concat
+  handled (PG/Oracle `||`, MySQL `concat`, MSSQL `+CAST`; Oracle adds `FROM dual`).
+  - `--no-union` to skip it, `--union-cols N` to bound the column probe (default 12).
+  - Reflection-only targets with no blind signal: pass `--dbms` so it can run.
+- **`--tamper`** WAF evasion (comma-separated): `space2comment`, `randomcase`, `charencode`.
+  The string tampers are **quote-aware** — they never alter text inside `'...'` literals, so
+  markers, identifiers, and webshell payloads stay intact. `charencode` emits full `%XX`.
+
 ## v3.4.0 — review pass: fail-loud fingerprint, charset, decoupled timeout
 
 ### Added

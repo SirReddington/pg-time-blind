@@ -27,6 +27,7 @@ Unauthorized access is illegal in most jurisdictions. You alone are responsible 
 1. **Context** — finds how the injection breaks out: string vs numeric, `AND` / `OR`, or stacked.
 2. **DBMS** — fingerprints the backend automatically (PostgreSQL, MySQL, MSSQL, Oracle).
 3. **Technique** — picks the fastest available:
+   - **union-based** — when output is reflected, reads each value in **one request** via `UNION SELECT`.
    - **error-based** — forces a DB error that reflects the value; dumps it in **one request**.
    - **boolean-based** — auto-calibrates a TRUE/FALSE signal (status code → body length → digit-stripped token).
    - **time-based** — `pg_sleep` / `SLEEP` / `WAITFOR` oracle; last resort.
@@ -142,6 +143,9 @@ python3 blindfold.py [target] [action] [detection] [tuning]
 | `--force-boolean` | Only use boolean-based |
 | `--force-time`    | Only use time-based |
 | `--no-error`      | Don't use error-based even if available |
+| `--no-union`      | Don't try UNION (reflected) extraction |
+| `--union-cols`    | Max columns to probe for UNION (default `12`) |
+| `--tamper`        | WAF evasion (comma-separated): `space2comment`, `randomcase`, `charencode` |
 | `--allow-or`      | Include risky `OR` contexts (may change app state) |
 | `--true-match`    | String present **only** in a TRUE response (overrides calibration) |
 | `--false-match`   | String present **only** in a FALSE response |
