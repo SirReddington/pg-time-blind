@@ -124,6 +124,7 @@ python3 blindfold.py [target] [action] [detection] [tuning]
 | *(none)*      | Map mode — DBMS, current database, and table names |
 | `--dump TABLE`| Dump rows of a table (columns auto-discovered) |
 | `--max-rows`  | Row cap for `--dump` (default `50`) |
+| `--wordlist`  | Extra candidate names for gentle table/column probing on length-capped points (file, one name per line) |
 | `--query`     | Extract a single SQL scalar (power mode) |
 | `--rce [CMD]` | OS command execution via the DBMS (no CMD = interactive shell) |
 | `--webshell`  | Drop a webshell file, verify it, and report the path |

