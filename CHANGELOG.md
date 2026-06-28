@@ -1,5 +1,19 @@
 # Changelog
 
+## v3.6.7 — column-at-a-time dumping that fits length caps
+
+### Changed
+- **`--dump` now extracts one column per request instead of one row.** The old approach asked
+  for a row count (a numeric value needing the longer `~`-forced payload) and then concatenated
+  *every column* into a single per-row query — both overflow a tight length cap, so dumps came
+  back `rows: 0`. blindfold now runs a short `string_agg(col)` per column: every value of that
+  column rides back in one error (the result isn't length-capped — only the injected query is),
+  and the rows are reassembled client-side. New per-DBMS `q_col` (PG `::text`, MySQL
+  `group_concat`, MSSQL `string_agg`, Oracle `listagg`). The row count is derived from the data,
+  so the separate (and often un-castable) count query is gone.
+- Gentle and honest under pressure: it's one request per column, and any column whose query is
+  still too long for the cap is reported by name so you can pull it with a targeted `--query`.
+
 ## v3.6.6 — precise time-based detection (no phantom fires)
 
 ### Fixed
