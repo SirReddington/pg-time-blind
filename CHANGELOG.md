@@ -1,5 +1,18 @@
 # Changelog
 
+## v3.6.8 — per-cell dump fallback for the tightest caps
+
+### Added
+- **Per-cell extraction fallback in `--dump`.** When even the column-at-a-time `string_agg`
+  query is too long for the injection point's cap, blindfold drops to the smallest possible
+  read: one column / one row via `SELECT <col> FROM <table> LIMIT 1 OFFSET <n>`, iterating rows
+  until the first empty one. This is the exact short shape that already worked for `--query`, so
+  it succeeds on caps that defeat every wider query. One request per cell — used only as a last
+  resort, after the gentler per-column path. (PostgreSQL / MySQL.)
+- **`ident_lean()`** — emits a bare identifier for plainly-safe lower-case names (saving the two
+  quote characters that can decide whether a read fits the cap) and falls back to full quoting
+  for anything else, so it never weakens identifier safety.
+
 ## v3.6.7 — column-at-a-time dumping that fits length caps
 
 ### Changed
