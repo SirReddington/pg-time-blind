@@ -1,5 +1,25 @@
 # Changelog
 
+## v3.7.2 — empty columns cost nothing extra
+
+### Changed
+- **Per-column charset learning is now lazy.** The smart-charset probe is only run once a column
+  is confirmed to have data. An empty / NULL column therefore costs nothing beyond its single
+  length probe — no wasted character-class probing on a column with nothing to extract — while
+  populated columns are still optimised exactly as before. `read_scalar` gained an optional
+  `charset_fn` invoked only after the length check passes.
+
+## v3.7.1 — honest "empty column" reporting
+
+### Fixed
+- **`--dump` no longer blames a length cap when a column is simply empty.** A column that is
+  NULL / has no data came back empty and was reported as "too long for the cap", which was
+  misleading on boolean/time dumps where no payload-length cap is even in play. dump now
+  distinguishes the two cases by how the read returned: `None` means the read genuinely failed
+  (a real cap — keeps the targeted-`--query` hint), while an empty string means the query ran
+  fine and the column just has no data (reported as "empty / NULL for every row"). The
+  boolean/time path — the common dump case — now reports NULL columns precisely.
+
 ## v3.7.0 — fewer requests, visible progress
 
 ### Added
