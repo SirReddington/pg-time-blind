@@ -1,5 +1,25 @@
 # Changelog
 
+## v3.7.0 — fewer requests, visible progress
+
+### Added
+- **Automatic per-column charset (data-driven).** For boolean/time `--dump` (when `--charset`
+  isn't pinned), blindfold asks the database which character class *every* value of a column
+  fits — `bool_and(col ~ '^[class]*$')`, narrowest first — and then binary-searches each
+  character within only that alphabet. Because the class is confirmed against the real data, it
+  provably covers every character: no guessing from column names, and no "widen and retry". A
+  numeric column drops from ~7 to ~3.5 requests/char, lowercase to ~5 — typically 25–50% fewer
+  requests on boolean/time dumps, for ~1–6 cheap probes per column. PostgreSQL today (uses the
+  `~` regex operator); other engines fall back to the full search automatically.
+- **Live progressive output during `--dump`.** Columns are printed as soon as they're
+  discovered, and each value streams to the screen as it's recovered — so a slow boolean/time
+  extraction shows visible progress instead of a long silence. (No `-v` needed.)
+
+### Changed
+- **Detection tries error-based before the slow time probe.** error-based is one request and
+  self-identifying, so on a visible-error target blindfold no longer pays for (or prints) a
+  time-based probe first. Order is now UNION → error → time (last resort).
+
 ## v3.6.8 — per-cell dump fallback for the tightest caps
 
 ### Added
